@@ -20,6 +20,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/chzyer/readline"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/crypto"
@@ -39,7 +40,7 @@ import (
 // --- Configuration & Constants ---
 
 const (
-	ProtocolVersion  = "1.1.0-alpha" // Bumped for breaking changes
+	ProtocolVersion  = "1.1.0-alpha"
 	ProtocolID       = "/f2f-chat/1.1.0"
 	RendezvousString = "f2f-chat-alpha-v1"
 	ContactsFile     = "contacts.json"
@@ -156,27 +157,27 @@ const (
 	MsgTypeBye       = "bye"
 )
 
-// InnerMessage — шифруется целиком (включая метаданные)
+// InnerMessage — шифруется целиком
 type InnerMessage struct {
 	Type      string `json:"t"`
 	Timestamp int64  `json:"ts"`
 	Content   string `json:"c,omitempty"`
 }
 
-// HandshakePayload — отправляется в handshake
+// HandshakePayload
 type HandshakePayload struct {
 	Version      string `json:"v"`
 	Timestamp    int64  `json:"ts"`
 	Nonce        int64  `json:"n"`
 	NaClPubKey   []byte `json:"key"`
-	EphemeralPub []byte `json:"eph"` // NEW: эфемерный ключ для Forward Secrecy
+	EphemeralPub []byte `json:"eph"`
 	Signature    []byte `json:"sig"`
 }
 
 type Contact struct {
 	Nickname    string   `json:"nick"`
 	PeerID      peer.ID  `json:"pid"`
-	PublicKey   [32]byte `json:"pub"` // Статический NaCl ключ (для верификации)
+	PublicKey   [32]byte `json:"pub"`
 	LastMsgTime int64    `json:"-"`
 
 	SeenNonces map[int64]time.Time `json:"-"`
@@ -193,12 +194,12 @@ type Contact struct {
 	FailCount     int            `json:"-"`
 	NextCheckTime time.Time      `json:"-"`
 
-	// Forward Secrecy: эфемерные ключи сессии
+	// Forward Secrecy
 	localEphPriv *[32]byte `json:"-"`
 	localEphPub  *[32]byte `json:"-"`
 	remoteEphPub *[32]byte `json:"-"`
-	sessionKey   *[32]byte `json:"-"` // Симметричный ключ для secretbox
-	sessionEstab bool      `json:"-"` // Сессия установлена
+	sessionKey   *[32]byte `json:"-"`
+	sessionEstab bool      `json:"-"`
 
 	mu      sync.Mutex `json:"-"`
 	writeMu sync.Mutex `json:"-"`
@@ -231,6 +232,10 @@ type Node struct {
 	cancel context.CancelFunc
 
 	presenceChan chan peer.ID
+
+	// Input handling
+	rl          *readline.Instance
+	useReadline bool
 }
 
 // --- Main ---
@@ -267,6 +272,21 @@ func main() {
 		node.Debug("Контакты не найдены: %v", err)
 	}
 
+	// Пробуем readline, fallback на scanner
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:          "> ",
+		InterruptPrompt: "^C",
+		EOFPrompt:       ".exit",
+	})
+	if err == nil {
+		node.rl = rl
+		node.useReadline = true
+		defer rl.Close()
+	} else {
+		node.useReadline = false
+		fmt.Printf("[SYS] Readline недоступен (%v), используем простой режим\n", err)
+	}
+
 	fmt.Print("\033[H\033[2J")
 	node.printBanner()
 
@@ -280,130 +300,159 @@ func main() {
 		node.SafePrintf("%s Введите .login <ник> для создания профиля\n", Style.Info)
 	}
 
+	// Выбор метода ввода
+	if node.useReadline {
+		node.runWithReadline()
+	} else {
+		node.runWithScanner()
+	}
+}
+
+// runWithReadline — основной цикл с readline (сохранение ввода)
+func (n *Node) runWithReadline() {
+	for {
+		n.updatePrompt()
+		line, err := n.rl.Readline()
+		if err != nil {
+			if err == readline.ErrInterrupt {
+				continue
+			}
+			// EOF или другая ошибка
+			break
+		}
+
+		n.processInputLine(line)
+	}
+}
+
+// runWithScanner — fallback для IDE/pipe
+func (n *Node) runWithScanner() {
 	scanner := bufio.NewScanner(os.Stdin)
-	node.printPrompt()
+	n.printPrompt()
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-
-		if line == "" {
-			node.printPrompt()
-			continue
-		}
-
-		node.mu.RLock()
-		currentChatID := node.activeChat
-		node.mu.RUnlock()
-
-		if currentChatID != "" && !strings.HasPrefix(line, ".") {
-			cleanMsg := SanitizeInput(line, MaxMsgLength)
-			if cleanMsg != "" {
-				fmt.Print("\033[A\r\033[K")
-				node.SendChatMessage(currentChatID, cleanMsg)
-			}
-			node.printPrompt()
-			continue
-		}
-
-		parts := strings.Fields(line)
-		cmd := strings.ToLower(parts[0])
-
-		switch cmd {
-		case ".login":
-			if len(parts) < 2 {
-				node.SafePrintf("Использование: .login <nickname>\n")
-			} else {
-				cleanNick := SanitizeInput(parts[1], MaxNickLength)
-				node.Login(cleanNick)
-			}
-
-		case ".logout":
-			node.SafePrintf("%s Сброс личности...\n", Style.Warning)
-			if err := os.Remove(IdentityFile); err != nil {
-				node.SafePrintf("%s Ошибка удаления файла: %v\n", Style.Fail, err)
-			} else {
-				node.SafePrintf("%s Личность удалена. Перезапустите программу.\n", Style.OK)
-				return
-			}
-
-		case ".bootstrap":
-			node.ConnectToBootstrap()
-
-		case ".info":
-			node.ShowInfo()
-
-		case ".fingerprint":
-			if len(parts) < 2 {
-				node.ShowFingerprint("")
-			} else {
-				node.ShowFingerprint(parts[1])
-			}
-
-		case ".addfriend":
-			if len(parts) >= 4 {
-				node.AddFriend(parts[1], parts[2], parts[3])
-			} else {
-				node.SafePrintf("Использование: .addfriend <nick> <peerID> <pubkey>\n")
-			}
-
-		case ".connect":
-			if len(parts) < 2 {
-				node.SafePrintf("Использование: .connect <nickname>\n")
-			} else {
-				go func(nick string) {
-					node.InitConnect(nick)
-					node.printPrompt()
-				}(parts[1])
-				continue
-			}
-
-		case ".accept":
-			if len(parts) < 2 {
-				node.SafePrintf("Использование: .accept <nickname>\n")
-			} else {
-				node.HandleDecision(parts[1], true)
-			}
-
-		case ".decline":
-			if len(parts) < 2 {
-				node.SafePrintf("Использование: .decline <nickname>\n")
-			} else {
-				node.HandleDecision(parts[1], false)
-			}
-
-		case ".leave":
-			node.LeaveChat()
-
-		case ".list":
-			node.ListContacts()
-
-		case ".check":
-			node.SafePrintf("%s Запуск принудительной проверки...\n", Style.Info)
-			node.ForceCheckAll()
-
-		case ".find":
-			if len(parts) < 2 {
-				node.SafePrintf("Использование: .find <nickname>\n")
-			} else {
-				go func(nick string) {
-					node.FindContact(nick)
-					node.printPrompt()
-				}(parts[1])
-				continue
-			}
-
-		case ".help":
-			node.printHelp()
-
-		case ".exit", ".quit", ".q":
-			node.SafePrintf("%s Выход...\n", Style.Info)
+		line := scanner.Text()
+		if !n.processInputLine(line) {
 			return
-
-		default:
-			node.SafePrintf("%s Неизвестная команда. .help\n", Style.Warning)
 		}
-		node.printPrompt()
+		n.printPrompt()
 	}
+}
+
+// processInputLine — обработка введённой строки, возвращает false для выхода
+func (n *Node) processInputLine(line string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return true
+	}
+
+	n.mu.RLock()
+	currentChatID := n.activeChat
+	n.mu.RUnlock()
+
+	// Если в чате и не команда — отправить сообщение
+	if currentChatID != "" && !strings.HasPrefix(line, ".") {
+		cleanMsg := SanitizeInput(line, MaxMsgLength)
+		if cleanMsg != "" {
+			n.SendChatMessage(currentChatID, cleanMsg)
+		}
+		return true
+	}
+
+	parts := strings.Fields(line)
+	if len(parts) == 0 {
+		return true
+	}
+	cmd := strings.ToLower(parts[0])
+
+	switch cmd {
+	case ".login":
+		if len(parts) < 2 {
+			n.SafePrintf("Использование: .login <nickname>\n")
+		} else {
+			cleanNick := SanitizeInput(parts[1], MaxNickLength)
+			n.Login(cleanNick)
+		}
+
+	case ".logout":
+		n.SafePrintf("%s Сброс личности...\n", Style.Warning)
+		if err := os.Remove(IdentityFile); err != nil {
+			n.SafePrintf("%s Ошибка удаления файла: %v\n", Style.Fail, err)
+		} else {
+			n.SafePrintf("%s Личность удалена. Перезапустите программу.\n", Style.OK)
+			return false
+		}
+
+	case ".bootstrap":
+		n.ConnectToBootstrap()
+
+	case ".info":
+		n.ShowInfo()
+
+	case ".fingerprint":
+		if len(parts) < 2 {
+			n.ShowFingerprint("")
+		} else {
+			n.ShowFingerprint(parts[1])
+		}
+
+	case ".addfriend":
+		if len(parts) >= 4 {
+			n.AddFriend(parts[1], parts[2], parts[3])
+		} else {
+			n.SafePrintf("Использование: .addfriend <nick> <peerID> <pubkey>\n")
+		}
+
+	case ".connect":
+		if len(parts) < 2 {
+			n.SafePrintf("Использование: .connect <nickname>\n")
+		} else {
+			go n.InitConnect(parts[1])
+		}
+
+	case ".accept":
+		if len(parts) < 2 {
+			n.SafePrintf("Использование: .accept <nickname>\n")
+		} else {
+			n.HandleDecision(parts[1], true)
+		}
+
+	case ".decline":
+		if len(parts) < 2 {
+			n.SafePrintf("Использование: .decline <nickname>\n")
+		} else {
+			n.HandleDecision(parts[1], false)
+		}
+
+	case ".leave":
+		n.LeaveChat()
+
+	case ".list":
+		n.ListContacts()
+
+	case ".check":
+		n.SafePrintf("%s Запуск принудительной проверки...\n", Style.Info)
+		n.ForceCheckAll()
+
+	case ".find":
+		if len(parts) < 2 {
+			n.SafePrintf("Использование: .find <nickname>\n")
+		} else {
+			go n.FindContact(parts[1])
+		}
+
+	case ".help":
+		n.printHelp()
+
+	case ".exit", ".quit", ".q":
+		n.SafePrintf("%s Выход...\n", Style.Info)
+		return false
+
+	default:
+		n.SafePrintf("%s Неизвестная команда. .help\n", Style.Warning)
+	}
+
+	return true
 }
 
 // --- UI Helpers ---
@@ -412,11 +461,56 @@ func visibleLen(s string) int {
 	return utf8.RuneCountInString(s)
 }
 
+// updatePrompt обновляет промпт readline
+func (n *Node) updatePrompt() {
+	if !n.useReadline || n.rl == nil {
+		return
+	}
+
+	n.mu.RLock()
+	activeID := n.activeChat
+	var activeNick string
+	if activeID != "" {
+		if c, ok := n.contacts[activeID]; ok {
+			activeNick = c.Nickname
+		}
+	}
+	n.mu.RUnlock()
+
+	if activeNick != "" {
+		n.rl.SetPrompt(fmt.Sprintf("[%s] > ", activeNick))
+	} else {
+		n.rl.SetPrompt("> ")
+	}
+}
+
+// printPrompt — для fallback режима
+func (n *Node) printPrompt() {
+	n.mu.RLock()
+	activeID := n.activeChat
+	var activeNick string
+	if activeID != "" {
+		if c, ok := n.contacts[activeID]; ok {
+			activeNick = c.Nickname
+		}
+	}
+	n.mu.RUnlock()
+
+	if activeNick != "" {
+		fmt.Printf("[%s] > ", activeNick)
+	} else {
+		fmt.Print("> ")
+	}
+}
+
 func (n *Node) drawBox(title string, lines []string) {
 	n.uiMu.Lock()
 	defer n.uiMu.Unlock()
 
-	fmt.Print("\r\033[K")
+	// Сохраняем текущий ввод
+	if n.useReadline && n.rl != nil {
+		n.rl.Clean()
+	}
 
 	contentWidth := 0
 	if title != "" {
@@ -466,6 +560,11 @@ func (n *Node) drawBox(title string, lines []string) {
 	fmt.Print(Style.BottomLeft)
 	fmt.Print(strings.Repeat(Style.Horizontal, contentWidth+2))
 	fmt.Println(Style.BottomRight)
+
+	// Восстанавливаем ввод
+	if n.useReadline && n.rl != nil {
+		n.rl.Refresh()
+	}
 }
 
 func (n *Node) printBanner() {
@@ -498,49 +597,19 @@ func (n *Node) printHelp() {
 	})
 }
 
-func (n *Node) printPrompt() {
-	n.mu.RLock()
-	activeID := n.activeChat
-	var activeNick string
-	if activeID != "" {
-		if c, ok := n.contacts[activeID]; ok {
-			activeNick = c.Nickname
-		}
-	}
-	n.mu.RUnlock()
-
-	n.uiMu.Lock()
-	defer n.uiMu.Unlock()
-
-	fmt.Print("\r\033[K")
-	if activeNick != "" {
-		fmt.Printf("[%s] > ", activeNick)
-	} else {
-		fmt.Print("> ")
-	}
-}
-
+// SafePrintf — безопасно выводит сообщение, сохраняя текущий ввод
 func (n *Node) SafePrintf(format string, a ...any) {
 	n.uiMu.Lock()
 	defer n.uiMu.Unlock()
 
-	fmt.Print("\r\033[K")
+	if n.useReadline && n.rl != nil {
+		n.rl.Clean()
+	}
+
 	fmt.Printf(format, a...)
 
-	n.mu.RLock()
-	activeID := n.activeChat
-	var activeNick string
-	if activeID != "" {
-		if c, ok := n.contacts[activeID]; ok {
-			activeNick = c.Nickname
-		}
-	}
-	n.mu.RUnlock()
-
-	if activeNick != "" {
-		fmt.Printf("[%s] > ", activeNick)
-	} else {
-		fmt.Print("> ")
+	if n.useReadline && n.rl != nil {
+		n.rl.Refresh()
 	}
 }
 
@@ -558,11 +627,10 @@ func SanitizeInput(input string, maxLen int) string {
 	return string(safeRunes)
 }
 
-// --- Fingerprint для верификации ключей ---
+// --- Fingerprint ---
 
 func (n *Node) ShowFingerprint(nick string) {
 	if nick == "" {
-		// Показать свой fingerprint
 		fp := computeFingerprint(n.naclPublic[:])
 		n.drawBox("ВАШ FINGERPRINT", []string{
 			"Сравните с собеседником по телефону",
@@ -591,7 +659,6 @@ func (n *Node) ShowFingerprint(nick string) {
 
 func computeFingerprint(pubKey []byte) string {
 	hash := sha256.Sum256(pubKey)
-	// Формат: XXXX-XXXX-XXXX-XXXX (16 hex chars)
 	hex := fmt.Sprintf("%X", hash[:8])
 	return fmt.Sprintf("%s-%s-%s-%s", hex[0:4], hex[4:8], hex[8:12], hex[12:16])
 }
@@ -711,14 +778,13 @@ func NewNode(ctx context.Context) (*Node, error) {
 	return node, nil
 }
 
-// --- Forward Secrecy: Ephemeral Key Generation ---
+// --- Forward Secrecy ---
 
 func generateEphemeralKeys() (*[32]byte, *[32]byte, error) {
 	var priv, pub [32]byte
 	if _, err := io.ReadFull(rand.Reader, priv[:]); err != nil {
 		return nil, nil, err
 	}
-	// Clamp private key for X25519
 	priv[0] &= 248
 	priv[31] &= 127
 	priv[31] |= 64
@@ -727,27 +793,26 @@ func generateEphemeralKeys() (*[32]byte, *[32]byte, error) {
 	return &priv, &pub, nil
 }
 
-func deriveSessionKey(localPriv, remotePub *[32]byte, isInitiator bool) (*[32]byte, error) {
-	// X25519 shared secret
+func deriveSessionKey(localPriv, localPub, remotePub *[32]byte) (*[32]byte, error) {
 	var shared [32]byte
 	curve25519.ScalarMult(&shared, localPriv, remotePub)
 
-	// HKDF для получения симметричного ключа
-	// Salt включает роли для предотвращения key reuse
-	var salt []byte
-	if isInitiator {
-		salt = []byte("f2f-session-initiator-v1")
+	var saltBuf bytes.Buffer
+	saltBuf.WriteString("f2f-session-v1:")
+	if bytes.Compare(localPub[:], remotePub[:]) < 0 {
+		saltBuf.Write(localPub[:])
+		saltBuf.Write(remotePub[:])
 	} else {
-		salt = []byte("f2f-session-responder-v1")
+		saltBuf.Write(remotePub[:])
+		saltBuf.Write(localPub[:])
 	}
 
-	hkdfReader := hkdf.New(sha256.New, shared[:], salt, []byte("session-key"))
+	hkdfReader := hkdf.New(sha256.New, shared[:], saltBuf.Bytes(), []byte("session-key"))
 	var sessionKey [32]byte
 	if _, err := io.ReadFull(hkdfReader, sessionKey[:]); err != nil {
 		return nil, err
 	}
 
-	// Очистка shared secret
 	for i := range shared {
 		shared[i] = 0
 	}
@@ -755,9 +820,8 @@ func deriveSessionKey(localPriv, remotePub *[32]byte, isInitiator bool) (*[32]by
 	return &sessionKey, nil
 }
 
-// --- Crypto: Session-based encryption ---
+// --- Crypto ---
 
-// encryptSession шифрует сообщение сессионным ключом (secretbox)
 func (n *Node) encryptSession(msg *InnerMessage, sessionKey *[32]byte) ([]byte, error) {
 	plaintext, err := json.Marshal(msg)
 	if err != nil {
@@ -773,7 +837,6 @@ func (n *Node) encryptSession(msg *InnerMessage, sessionKey *[32]byte) ([]byte, 
 	return encrypted, nil
 }
 
-// decryptSession расшифровывает сообщение сессионным ключом
 func (n *Node) decryptSession(ciphertext []byte, sessionKey *[32]byte) (*InnerMessage, error) {
 	if len(ciphertext) < 24+secretbox.Overhead {
 		return nil, errors.New("ciphertext too short")
@@ -793,16 +856,6 @@ func (n *Node) decryptSession(ciphertext []byte, sessionKey *[32]byte) (*InnerMe
 	}
 
 	return &msg, nil
-}
-
-// encryptHandshake — для handshake используем box (асимметричное)
-func (n *Node) encryptHandshake(plain string, peerPub *[32]byte) (string, error) {
-	var nonce [24]byte
-	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
-		return "", err
-	}
-	out := box.Seal(nil, []byte(plain), &nonce, peerPub, &n.naclPrivate)
-	return base64.StdEncoding.EncodeToString(append(nonce[:], out...)), nil
 }
 
 // --- Presence Discovery ---
@@ -1058,8 +1111,8 @@ func (n *Node) Login(nickname string) {
 	n.saveIdentity()
 	n.SafePrintf("%s Вы вошли как: %s\n", Style.OK, nickname)
 	go func() {
+		time.Sleep(100 * time.Millisecond)
 		n.ShowInfo()
-		n.printPrompt()
 	}()
 }
 
@@ -1190,7 +1243,6 @@ func (n *Node) AddFriend(nickname, peerIDStr, pubKeyB64 string) {
 	go func() {
 		time.Sleep(1 * time.Second)
 		n.FindContact(nickname)
-		n.printPrompt()
 	}()
 }
 
@@ -1299,7 +1351,6 @@ func (n *Node) InitConnect(nickname string) {
 	c.FailCount = 0
 	c.mu.Unlock()
 
-	// Генерация эфемерных ключей
 	ephPriv, ephPub, err := generateEphemeralKeys()
 	if err != nil {
 		n.SafePrintf("%s Ошибка генерации ключей: %v\n", Style.Fail, err)
@@ -1320,6 +1371,7 @@ func (n *Node) InitConnect(nickname string) {
 	}
 
 	if err := n.writeFrame(s, hsBytes); err != nil {
+		n.SafePrintf("%s Ошибка отправки handshake: %v\n", Style.Fail, err)
 		n.closeStream(c)
 		return
 	}
@@ -1331,7 +1383,7 @@ func (n *Node) InitConnect(nickname string) {
 	n.SafePrintf("%s Handshake отправлен, ждем ответа...\n", Style.OK)
 
 	n.wg.Add(1)
-	go n.readLoop(c, true) // isInitiator = true
+	go n.readLoop(c, true)
 }
 
 func (n *Node) HandleDecision(nick string, accept bool) {
@@ -1393,9 +1445,9 @@ func (n *Node) handleStream(s network.Stream) {
 	c.FailCount = 0
 	c.mu.Unlock()
 
-	// Генерация эфемерных ключей
 	ephPriv, ephPub, err := generateEphemeralKeys()
 	if err != nil {
+		n.Debug("Ошибка генерации ключей: %v", err)
 		n.closeStream(c)
 		return
 	}
@@ -1407,17 +1459,19 @@ func (n *Node) handleStream(s network.Stream) {
 
 	hsBytes, err := n.createHandshakeBytes(ephPub)
 	if err != nil {
+		n.Debug("Ошибка handshake: %v", err)
 		n.closeStream(c)
 		return
 	}
 
 	if err := n.writeFrame(s, hsBytes); err != nil {
+		n.Debug("Ошибка отправки handshake: %v", err)
 		n.closeStream(c)
 		return
 	}
 
 	n.wg.Add(1)
-	go n.readLoop(c, false) // isInitiator = false
+	go n.readLoop(c, false)
 }
 
 func (n *Node) readLoop(c *Contact, isInitiator bool) {
@@ -1432,33 +1486,34 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 		return
 	}
 
-	// Читаем handshake от другой стороны
 	s.SetReadDeadline(time.Now().Add(HandshakeTimeout))
 	hsData, err := n.readFrame(s)
 	if err != nil {
 		n.Debug("Handshake read err: %v", err)
+		n.SafePrintf("%s Ошибка чтения handshake\n", Style.Fail)
 		return
 	}
 
 	remoteEphPub, err := n.verifyHandshake(c, hsData)
 	if err != nil {
 		n.Debug("Handshake verify fail: %v", err)
+		n.SafePrintf("%s Ошибка верификации: %v\n", Style.Fail, err)
 		return
 	}
 
-	// Устанавливаем сессионный ключ
 	c.mu.Lock()
 	c.remoteEphPub = remoteEphPub
-	sessionKey, err := deriveSessionKey(c.localEphPriv, remoteEphPub, isInitiator)
+
+	sessionKey, err := deriveSessionKey(c.localEphPriv, c.localEphPub, remoteEphPub)
 	if err != nil {
 		c.mu.Unlock()
 		n.Debug("Session key derivation failed: %v", err)
+		n.SafePrintf("%s Ошибка создания сессии\n", Style.Fail)
 		return
 	}
 	c.sessionKey = sessionKey
 	c.sessionEstab = true
 
-	// Очистка эфемерного приватного ключа (Forward Secrecy!)
 	for i := range c.localEphPriv {
 		c.localEphPriv[i] = 0
 	}
@@ -1467,16 +1522,16 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 
 	n.Debug("Session established with %s (initiator=%v)", c.Nickname, isInitiator)
 
-	// Если мы инициатор — отправляем request
 	if isInitiator {
 		if err := n.sendSessionMessage(c, MsgTypeRequest, "Chat Request"); err != nil {
+			n.SafePrintf("%s Ошибка отправки запроса: %v\n", Style.Fail, err)
 			return
 		}
+		n.Debug("Request sent to %s", c.Nickname)
 	}
 
 	go n.SaveContacts()
 
-	// Основной цикл чтения
 	for {
 		c.mu.Lock()
 		if c.Stream != s {
@@ -1493,6 +1548,7 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 		s.SetReadDeadline(time.Now().Add(StreamReadTimeout))
 		data, err := n.readFrame(s)
 		if err != nil {
+			n.Debug("Read error: %v", err)
 			return
 		}
 
@@ -1568,7 +1624,7 @@ func (n *Node) processMessage(c *Contact, msgType string, ts int64, body string)
 		n.mu.RUnlock()
 
 		if active {
-			n.SafePrintf("\r[%s %s]: %s\n", c.Nickname, timestamp, body)
+			n.SafePrintf("[%s %s]: %s\n", c.Nickname, timestamp, body)
 		} else {
 			n.SafePrintf("\n%s От %s:\n", Style.Mail, c.Nickname)
 			n.SafePrintf("[%s %s]: %s\n", c.Nickname, timestamp, body)
@@ -1596,7 +1652,7 @@ func (n *Node) SendChatMessage(peerID peer.ID, text string) {
 		n.SafePrintf("%s Ошибка отправки: %v\n", Style.Fail, err)
 		return
 	}
-	n.SafePrintf("\r[Вы %s]: %s\n", time.Now().Format("15:04"), text)
+	n.SafePrintf("[Вы %s]: %s\n", time.Now().Format("15:04"), text)
 }
 
 // --- Handshake ---
@@ -1617,7 +1673,6 @@ func (n *Node) createHandshakeBytes(ephPub *[32]byte) ([]byte, error) {
 		EphemeralPub: ephPub[:],
 	}
 
-	// Подписываем все данные включая эфемерный ключ
 	buf := new(bytes.Buffer)
 	buf.WriteString(payload.Version)
 	binary.Write(buf, binary.LittleEndian, payload.Timestamp)
@@ -1658,7 +1713,6 @@ func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 		return nil, errors.New("timestamp skew")
 	}
 
-	// Nonce replay check
 	c.mu.Lock()
 	if c.SeenNonces == nil {
 		c.SeenNonces = make(map[int64]time.Time)
@@ -1679,7 +1733,6 @@ func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 	c.SeenNonces[payload.Nonce] = time.Now()
 	c.mu.Unlock()
 
-	// Верификация подписи
 	remotePub := n.host.Peerstore().PubKey(c.PeerID)
 	if remotePub == nil {
 		return nil, errors.New("no public key for peer")
@@ -1697,7 +1750,6 @@ func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 		return nil, errors.New("signature invalid")
 	}
 
-	// Проверка статического ключа
 	var recKey [32]byte
 	copy(recKey[:], payload.NaClPubKey)
 	if recKey != c.PublicKey {
@@ -1757,6 +1809,8 @@ func (n *Node) enterChat(id peer.ID) {
 	nick := c.Nickname
 	n.mu.Unlock()
 
+	n.updatePrompt()
+
 	n.drawBox(fmt.Sprintf("ЧАТ: %s", nick), []string{
 		"Forward Secrecy: ACTIVE",
 		".leave - выход",
@@ -1768,6 +1822,8 @@ func (n *Node) LeaveChat() {
 	id := n.activeChat
 	n.activeChat = ""
 	n.mu.Unlock()
+
+	n.updatePrompt()
 
 	if id == "" {
 		n.SafePrintf("%s Вы не в чате\n", Style.Warning)
@@ -1791,7 +1847,6 @@ func (n *Node) closeStream(c *Contact) {
 	c.State = StateIdle
 	c.Connecting = false
 
-	// Очистка сессионных данных
 	if c.sessionKey != nil {
 		for i := range c.sessionKey {
 			c.sessionKey[i] = 0
@@ -1822,7 +1877,6 @@ func (n *Node) handleDisconnect(c *Contact, err error) {
 	c.State = StateIdle
 	c.Connecting = false
 
-	// Очистка сессионных данных
 	if c.sessionKey != nil {
 		for i := range c.sessionKey {
 			c.sessionKey[i] = 0
@@ -1848,6 +1902,7 @@ func (n *Node) handleDisconnect(c *Contact, err error) {
 	n.mu.Unlock()
 
 	if wasActive {
+		n.updatePrompt()
 		n.SafePrintf("\n%s %s отключился (сессия уничтожена)\n", Style.Warning, nick)
 	}
 }
@@ -1881,6 +1936,10 @@ func (n *Node) Shutdown() {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
+	}
+
+	if n.rl != nil {
+		n.rl.Close()
 	}
 
 	n.host.Close()
