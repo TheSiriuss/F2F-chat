@@ -1,0 +1,72 @@
+# --- Project Specific (Самое важное) ---
+# Файл с приватными ключами (IdentityFile).
+# Если это попадет в репозиторий — меняй личность.
+identity.json
+
+# База контактов (ContactsFile).
+# Это личные данные пользователя.
+contacts.json
+
+# --- Go Standard ---
+# Скомпилированные бинарники
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Бинарники проекта
+main
+f2f-chat
+f2f-chat-alpha
+/f2f-chat*
+
+# Go workspace (Go 1.18+)
+go.work
+go.work.sum
+
+# Папка для зависимостей
+vendor/
+
+# Build/Debug
+debug
+*.log
+*.pprof
+coverage.out
+coverage.html
+
+# --- IDE & System ---
+# VS Code
+.vscode/
+
+# JetBrains (GoLand)
+.idea/
+*.iml
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Mac
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# --- Environment ---
+.env
+.env.local
+.env.*.local
+
+# --- Temp/Test ---
+tmp/
+temp/
+*.tmp
+testdata/output/
