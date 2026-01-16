@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -66,6 +68,7 @@ const (
 	ReconnectCooldown   = 3 * time.Second
 	PresenceMaxWorkers  = 3
 	MaxNoncesPerContact = 100
+	ShutdownTimeout     = 3 * time.Second
 
 	MaxPresenceBackoff = 15 * time.Minute
 )
@@ -146,7 +149,6 @@ func (p PresenceStatus) String() string {
 	}
 }
 
-// Message types
 const (
 	MsgTypeHandshake = "hs"
 	MsgTypeRequest   = "req"
@@ -157,14 +159,12 @@ const (
 	MsgTypeBye       = "bye"
 )
 
-// InnerMessage — шифруется целиком
 type InnerMessage struct {
 	Type      string `json:"t"`
 	Timestamp int64  `json:"ts"`
 	Content   string `json:"c,omitempty"`
 }
 
-// HandshakePayload
 type HandshakePayload struct {
 	Version      string `json:"v"`
 	Timestamp    int64  `json:"ts"`
@@ -194,7 +194,6 @@ type Contact struct {
 	FailCount     int            `json:"-"`
 	NextCheckTime time.Time      `json:"-"`
 
-	// Forward Secrecy
 	localEphPriv *[32]byte `json:"-"`
 	localEphPub  *[32]byte `json:"-"`
 	remoteEphPub *[32]byte `json:"-"`
@@ -233,9 +232,10 @@ type Node struct {
 
 	presenceChan chan peer.ID
 
-	// Input handling
 	rl          *readline.Instance
 	useReadline bool
+	shutdownMu  sync.Mutex
+	isShutdown  bool
 }
 
 // --- Main ---
@@ -266,13 +266,22 @@ func main() {
 		fmt.Println("Критическая ошибка:", err)
 		os.Exit(1)
 	}
-	defer node.Shutdown()
+
+	// Обработка сигналов Ctrl+C, kill
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println() // Новая строка после ^C
+		node.Shutdown()
+		os.Exit(0)
+	}()
 
 	if err := node.LoadContacts(); err != nil {
 		node.Debug("Контакты не найдены: %v", err)
 	}
 
-	// Пробуем readline, fallback на scanner
+	// Пробуем readline
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          "> ",
 		InterruptPrompt: "^C",
@@ -281,10 +290,9 @@ func main() {
 	if err == nil {
 		node.rl = rl
 		node.useReadline = true
-		defer rl.Close()
 	} else {
 		node.useReadline = false
-		fmt.Printf("[SYS] Readline недоступен (%v), используем простой режим\n", err)
+		fmt.Printf("[SYS] Readline недоступен, простой режим\n")
 	}
 
 	fmt.Print("\033[H\033[2J")
@@ -300,32 +308,45 @@ func main() {
 		node.SafePrintf("%s Введите .login <ник> для создания профиля\n", Style.Info)
 	}
 
-	// Выбор метода ввода
+	// Основной цикл
 	if node.useReadline {
 		node.runWithReadline()
 	} else {
 		node.runWithScanner()
 	}
+
+	// Корректное завершение
+	node.Shutdown()
 }
 
-// runWithReadline — основной цикл с readline (сохранение ввода)
+// runWithReadline — readline режим
 func (n *Node) runWithReadline() {
+	defer func() {
+		if n.rl != nil {
+			n.rl.Close()
+		}
+	}()
+
 	for {
 		n.updatePrompt()
 		line, err := n.rl.Readline()
 		if err != nil {
 			if err == readline.ErrInterrupt {
-				continue
+				// Ctrl+C — выходим
+				fmt.Println()
+				return
 			}
-			// EOF или другая ошибка
-			break
+			// EOF — выходим
+			return
 		}
 
-		n.processInputLine(line)
+		if !n.processInputLine(line) {
+			return
+		}
 	}
 }
 
-// runWithScanner — fallback для IDE/pipe
+// runWithScanner — fallback режим
 func (n *Node) runWithScanner() {
 	scanner := bufio.NewScanner(os.Stdin)
 	n.printPrompt()
@@ -339,7 +360,7 @@ func (n *Node) runWithScanner() {
 	}
 }
 
-// processInputLine — обработка введённой строки, возвращает false для выхода
+// processInputLine — обработка строки, false = выход
 func (n *Node) processInputLine(line string) bool {
 	line = strings.TrimSpace(line)
 	if line == "" {
@@ -350,7 +371,6 @@ func (n *Node) processInputLine(line string) bool {
 	currentChatID := n.activeChat
 	n.mu.RUnlock()
 
-	// Если в чате и не команда — отправить сообщение
 	if currentChatID != "" && !strings.HasPrefix(line, ".") {
 		cleanMsg := SanitizeInput(line, MaxMsgLength)
 		if cleanMsg != "" {
@@ -377,9 +397,9 @@ func (n *Node) processInputLine(line string) bool {
 	case ".logout":
 		n.SafePrintf("%s Сброс личности...\n", Style.Warning)
 		if err := os.Remove(IdentityFile); err != nil {
-			n.SafePrintf("%s Ошибка удаления файла: %v\n", Style.Fail, err)
+			n.SafePrintf("%s Ошибка: %v\n", Style.Fail, err)
 		} else {
-			n.SafePrintf("%s Личность удалена. Перезапустите программу.\n", Style.OK)
+			n.SafePrintf("%s Удалено. Перезапустите программу.\n", Style.OK)
 			return false
 		}
 
@@ -431,7 +451,7 @@ func (n *Node) processInputLine(line string) bool {
 		n.ListContacts()
 
 	case ".check":
-		n.SafePrintf("%s Запуск принудительной проверки...\n", Style.Info)
+		n.SafePrintf("%s Проверка контактов...\n", Style.Info)
 		n.ForceCheckAll()
 
 	case ".find":
@@ -461,7 +481,6 @@ func visibleLen(s string) int {
 	return utf8.RuneCountInString(s)
 }
 
-// updatePrompt обновляет промпт readline
 func (n *Node) updatePrompt() {
 	if !n.useReadline || n.rl == nil {
 		return
@@ -484,7 +503,6 @@ func (n *Node) updatePrompt() {
 	}
 }
 
-// printPrompt — для fallback режима
 func (n *Node) printPrompt() {
 	n.mu.RLock()
 	activeID := n.activeChat
@@ -507,7 +525,6 @@ func (n *Node) drawBox(title string, lines []string) {
 	n.uiMu.Lock()
 	defer n.uiMu.Unlock()
 
-	// Сохраняем текущий ввод
 	if n.useReadline && n.rl != nil {
 		n.rl.Clean()
 	}
@@ -522,7 +539,6 @@ func (n *Node) drawBox(title string, lines []string) {
 			contentWidth = l
 		}
 	}
-
 	if contentWidth < 40 {
 		contentWidth = 40
 	}
@@ -561,7 +577,6 @@ func (n *Node) drawBox(title string, lines []string) {
 	fmt.Print(strings.Repeat(Style.Horizontal, contentWidth+2))
 	fmt.Println(Style.BottomRight)
 
-	// Восстанавливаем ввод
 	if n.useReadline && n.rl != nil {
 		n.rl.Refresh()
 	}
@@ -570,7 +585,7 @@ func (n *Node) drawBox(title string, lines []string) {
 func (n *Node) printBanner() {
 	n.drawBox(fmt.Sprintf("F2F MESSENGER %s", ProtocolVersion), []string{
 		"Forward Secrecy ENABLED",
-		".help - справка",
+		".help - справка | Ctrl+C - выход",
 	})
 }
 
@@ -580,24 +595,18 @@ func (n *Node) printHelp() {
 		".logout                - сбросить профиль",
 		".bootstrap             - подключиться к DHT",
 		".info                  - мои данные",
-		".fingerprint [nick]    - показать fingerprint",
+		".fingerprint [nick]    - fingerprint ключа",
 		".addfriend <n> <p> <k> - добавить контакт",
 		".connect <nick>        - начать чат",
-		".accept <nick>         - принять запрос",
-		".decline <nick>        - отклонить запрос",
+		".accept / .decline     - ответ на запрос",
 		".leave                 - выйти из чата",
-		".list                  - список контактов",
+		".list                  - контакты",
 		".check                 - обновить статусы",
-		".find <nick>           - найти контакт в DHT",
-		".exit                  - выход",
-		"",
-		"Безопасность:",
-		"  Forward Secrecy: новые ключи каждую сессию",
-		"  Метаданные зашифрованы внутри сессии",
+		".find <nick>           - найти в DHT",
+		".exit или Ctrl+C       - выход",
 	})
 }
 
-// SafePrintf — безопасно выводит сообщение, сохраняя текущий ввод
 func (n *Node) SafePrintf(format string, a ...any) {
 	n.uiMu.Lock()
 	defer n.uiMu.Unlock()
@@ -633,8 +642,7 @@ func (n *Node) ShowFingerprint(nick string) {
 	if nick == "" {
 		fp := computeFingerprint(n.naclPublic[:])
 		n.drawBox("ВАШ FINGERPRINT", []string{
-			"Сравните с собеседником по телефону",
-			"или при личной встрече:",
+			"Сравните по телефону/лично:",
 			"",
 			fp,
 		})
@@ -649,10 +657,8 @@ func (n *Node) ShowFingerprint(nick string) {
 
 	fp := computeFingerprint(c.PublicKey[:])
 	n.drawBox(fmt.Sprintf("FINGERPRINT: %s", nick), []string{
-		"Попросите собеседника выполнить:",
-		".fingerprint",
+		"Должно совпасть с .fingerprint у друга:",
 		"",
-		"Должно совпасть:",
 		fp,
 	})
 }
@@ -858,7 +864,7 @@ func (n *Node) decryptSession(ciphertext []byte, sessionKey *[32]byte) (*InnerMe
 	return &msg, nil
 }
 
-// --- Presence Discovery ---
+// --- Presence ---
 
 func (n *Node) presenceLoop() {
 	defer n.wg.Done()
@@ -887,25 +893,17 @@ func (n *Node) presenceLoop() {
 func (n *Node) presenceWorkerPool() {
 	defer n.wg.Done()
 
-	var wg sync.WaitGroup
-	for i := 0; i < PresenceMaxWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-n.ctx.Done():
-					return
-				case pid, ok := <-n.presenceChan:
-					if !ok {
-						return
-					}
-					n.checkSinglePresence(pid)
-				}
+	for {
+		select {
+		case <-n.ctx.Done():
+			return
+		case pid, ok := <-n.presenceChan:
+			if !ok {
+				return
 			}
-		}()
+			n.checkSinglePresence(pid)
+		}
 	}
-	wg.Wait()
 }
 
 func (n *Node) ForceCheckAll() {
@@ -984,7 +982,6 @@ func (n *Node) checkSinglePresence(pid peer.ID) {
 	ctx, cancel := context.WithTimeout(n.ctx, PresenceTimeout)
 	defer cancel()
 
-	n.Debug("Checking presence: %s", c.Nickname)
 	info, err := n.dht.FindPeer(ctx, pid)
 
 	c.mu.Lock()
@@ -1030,7 +1027,7 @@ func (n *Node) FindContact(nick string) {
 	elapsed := time.Since(start)
 
 	if err != nil {
-		n.SafePrintf("%s %s не найден (%.1fs): %v\n", Style.Fail, nick, elapsed.Seconds(), err)
+		n.SafePrintf("%s %s не найден (%.1fs)\n", Style.Fail, nick, elapsed.Seconds())
 		c.mu.Lock()
 		c.Presence = PresenceOffline
 		c.LastChecked = time.Now()
@@ -1038,7 +1035,7 @@ func (n *Node) FindContact(nick string) {
 		return
 	}
 
-	n.SafePrintf("%s %s найден за %.1fs! Адресов: %d\n", Style.OK, nick, elapsed.Seconds(), len(info.Addrs))
+	n.SafePrintf("%s %s найден! (%d адресов, %.1fs)\n", Style.OK, nick, len(info.Addrs), elapsed.Seconds())
 
 	c.mu.Lock()
 	c.Presence = PresenceOnline
@@ -1109,7 +1106,7 @@ func (n *Node) Login(nickname string) {
 	n.nickname = nickname
 	n.mu.Unlock()
 	n.saveIdentity()
-	n.SafePrintf("%s Вы вошли как: %s\n", Style.OK, nickname)
+	n.SafePrintf("%s Вы: %s\n", Style.OK, nickname)
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		n.ShowInfo()
@@ -1135,9 +1132,9 @@ func (n *Node) ShowInfo() {
 	if hasRelay {
 		statusLine = Style.Global + " GLOBAL (relay)"
 	} else if connectedPeers > 0 {
-		statusLine = Style.Searching + " ONLINE (ищем relay...)"
+		statusLine = Style.Searching + " ONLINE"
 	} else {
-		statusLine = Style.Offline + " OFFLINE (.bootstrap)"
+		statusLine = Style.Offline + " OFFLINE"
 	}
 
 	pubKeyB64 := base64.StdEncoding.EncodeToString(n.naclPublic[:])
@@ -1185,7 +1182,7 @@ func (n *Node) ConnectToBootstrap() {
 	if connected > 0 {
 		n.SafePrintf("%s Подключено к %d узлам\n", Style.OK, connected)
 		go func() {
-			time.Sleep(5 * time.Second)
+			time.Sleep(3 * time.Second)
 			n.ForceCheckAll()
 		}()
 	} else {
@@ -1200,7 +1197,7 @@ func (n *Node) AddFriend(nickname, peerIDStr, pubKeyB64 string) {
 	}
 	peerID, err := peer.Decode(peerIDStr)
 	if err != nil {
-		n.SafePrintf("%s Ошибка PeerID: %v\n", Style.Fail, err)
+		n.SafePrintf("%s Ошибка PeerID\n", Style.Fail)
 		return
 	}
 	if peerID == n.host.ID() {
@@ -1219,7 +1216,7 @@ func (n *Node) AddFriend(nickname, peerIDStr, pubKeyB64 string) {
 	n.mu.Lock()
 	if _, exists := n.nickMap[nickname]; exists {
 		n.mu.Unlock()
-		n.SafePrintf("%s Ник '%s' уже занят\n", Style.Fail, nickname)
+		n.SafePrintf("%s Ник '%s' занят\n", Style.Fail, nickname)
 		return
 	}
 	contact := &Contact{
@@ -1235,9 +1232,7 @@ func (n *Node) AddFriend(nickname, peerIDStr, pubKeyB64 string) {
 	n.mu.Unlock()
 
 	fp := computeFingerprint(pubKey[:])
-	n.SafePrintf("%s Контакт добавлен: %s\n", Style.OK, nickname)
-	n.SafePrintf("   Fingerprint: %s\n", fp)
-	n.SafePrintf("   Проверьте с .fingerprint %s\n", nickname)
+	n.SafePrintf("%s Добавлен: %s (FP: %s)\n", Style.OK, nickname, fp)
 
 	go n.SaveContacts()
 	go func() {
@@ -1287,7 +1282,7 @@ func (n *Node) readFrame(s network.Stream) ([]byte, error) {
 	return buf, nil
 }
 
-// --- Connection Logic ---
+// --- Connection ---
 
 func (n *Node) InitConnect(nickname string) {
 	c := n.getContactByNick(nickname)
@@ -1334,7 +1329,7 @@ func (n *Node) InitConnect(nickname string) {
 
 	s, err := n.host.NewStream(streamCtx, c.PeerID, ProtocolID)
 	if err != nil {
-		n.SafePrintf("%s Не удалось подключиться: %v\n", Style.Fail, err)
+		n.SafePrintf("%s Ошибка подключения: %v\n", Style.Fail, err)
 		return
 	}
 
@@ -1353,7 +1348,7 @@ func (n *Node) InitConnect(nickname string) {
 
 	ephPriv, ephPub, err := generateEphemeralKeys()
 	if err != nil {
-		n.SafePrintf("%s Ошибка генерации ключей: %v\n", Style.Fail, err)
+		n.SafePrintf("%s Ошибка ключей\n", Style.Fail)
 		n.closeStream(c)
 		return
 	}
@@ -1365,13 +1360,13 @@ func (n *Node) InitConnect(nickname string) {
 
 	hsBytes, err := n.createHandshakeBytes(ephPub)
 	if err != nil {
-		n.SafePrintf("%s Ошибка handshake: %v\n", Style.Fail, err)
+		n.SafePrintf("%s Ошибка handshake\n", Style.Fail)
 		n.closeStream(c)
 		return
 	}
 
 	if err := n.writeFrame(s, hsBytes); err != nil {
-		n.SafePrintf("%s Ошибка отправки handshake: %v\n", Style.Fail, err)
+		n.SafePrintf("%s Ошибка отправки\n", Style.Fail)
 		n.closeStream(c)
 		return
 	}
@@ -1380,7 +1375,7 @@ func (n *Node) InitConnect(nickname string) {
 	c.State = StatePending
 	c.mu.Unlock()
 
-	n.SafePrintf("%s Handshake отправлен, ждем ответа...\n", Style.OK)
+	n.SafePrintf("%s Ожидание ответа...\n", Style.OK)
 
 	n.wg.Add(1)
 	go n.readLoop(c, true)
@@ -1414,7 +1409,7 @@ func (n *Node) HandleDecision(nick string, accept bool) {
 	} else {
 		n.sendSessionMessage(c, MsgTypeDecline, "NO")
 		n.closeStream(c)
-		n.SafePrintf("%s Запрос от %s отклонен\n", Style.OK, c.Nickname)
+		n.SafePrintf("%s Отклонено\n", Style.OK)
 	}
 }
 
@@ -1422,7 +1417,6 @@ func (n *Node) handleStream(s network.Stream) {
 	remoteID := s.Conn().RemotePeer()
 	c := n.getContactByID(remoteID)
 	if c == nil {
-		n.Debug("Стрим от неизвестного: %s", remoteID.ShortString())
 		s.Close()
 		return
 	}
@@ -1447,7 +1441,6 @@ func (n *Node) handleStream(s network.Stream) {
 
 	ephPriv, ephPub, err := generateEphemeralKeys()
 	if err != nil {
-		n.Debug("Ошибка генерации ключей: %v", err)
 		n.closeStream(c)
 		return
 	}
@@ -1459,13 +1452,11 @@ func (n *Node) handleStream(s network.Stream) {
 
 	hsBytes, err := n.createHandshakeBytes(ephPub)
 	if err != nil {
-		n.Debug("Ошибка handshake: %v", err)
 		n.closeStream(c)
 		return
 	}
 
 	if err := n.writeFrame(s, hsBytes); err != nil {
-		n.Debug("Ошибка отправки handshake: %v", err)
 		n.closeStream(c)
 		return
 	}
@@ -1489,15 +1480,12 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 	s.SetReadDeadline(time.Now().Add(HandshakeTimeout))
 	hsData, err := n.readFrame(s)
 	if err != nil {
-		n.Debug("Handshake read err: %v", err)
-		n.SafePrintf("%s Ошибка чтения handshake\n", Style.Fail)
 		return
 	}
 
 	remoteEphPub, err := n.verifyHandshake(c, hsData)
 	if err != nil {
-		n.Debug("Handshake verify fail: %v", err)
-		n.SafePrintf("%s Ошибка верификации: %v\n", Style.Fail, err)
+		n.SafePrintf("%s Ошибка handshake: %v\n", Style.Fail, err)
 		return
 	}
 
@@ -1507,8 +1495,6 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 	sessionKey, err := deriveSessionKey(c.localEphPriv, c.localEphPub, remoteEphPub)
 	if err != nil {
 		c.mu.Unlock()
-		n.Debug("Session key derivation failed: %v", err)
-		n.SafePrintf("%s Ошибка создания сессии\n", Style.Fail)
 		return
 	}
 	c.sessionKey = sessionKey
@@ -1520,14 +1506,10 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 	c.localEphPriv = nil
 	c.mu.Unlock()
 
-	n.Debug("Session established with %s (initiator=%v)", c.Nickname, isInitiator)
-
 	if isInitiator {
-		if err := n.sendSessionMessage(c, MsgTypeRequest, "Chat Request"); err != nil {
-			n.SafePrintf("%s Ошибка отправки запроса: %v\n", Style.Fail, err)
+		if err := n.sendSessionMessage(c, MsgTypeRequest, ""); err != nil {
 			return
 		}
-		n.Debug("Request sent to %s", c.Nickname)
 	}
 
 	go n.SaveContacts()
@@ -1548,13 +1530,11 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 		s.SetReadDeadline(time.Now().Add(StreamReadTimeout))
 		data, err := n.readFrame(s)
 		if err != nil {
-			n.Debug("Read error: %v", err)
 			return
 		}
 
 		msg, err := n.decryptSession(data, sKey)
 		if err != nil {
-			n.Debug("Decrypt error: %v", err)
 			continue
 		}
 
@@ -1596,19 +1576,19 @@ func (n *Node) processMessage(c *Contact, msgType string, ts int64, body string)
 		}
 		c.State = StatePending
 		c.mu.Unlock()
-		n.SafePrintf("\n%s Запрос от %s!\n", Style.Bell, c.Nickname)
-		n.SafePrintf("   .accept %s  /  .decline %s\n", c.Nickname, c.Nickname)
+		n.SafePrintf("\n%s Запрос от %s! (.accept %s / .decline %s)\n",
+			Style.Bell, c.Nickname, c.Nickname, c.Nickname)
 
 	case MsgTypeAccept:
 		c.mu.Lock()
 		c.State = StateActive
 		c.mu.Unlock()
-		n.SafePrintf("\n%s %s принял запрос!\n", Style.OK, c.Nickname)
+		n.SafePrintf("\n%s %s принял!\n", Style.OK, c.Nickname)
 		n.enterChat(c.PeerID)
 
 	case MsgTypeDecline:
 		n.closeStream(c)
-		n.SafePrintf("\n%s %s отклонил запрос\n", Style.Fail, c.Nickname)
+		n.SafePrintf("\n%s %s отклонил\n", Style.Fail, c.Nickname)
 
 	case MsgTypeText:
 		c.mu.Lock()
@@ -1626,8 +1606,7 @@ func (n *Node) processMessage(c *Contact, msgType string, ts int64, body string)
 		if active {
 			n.SafePrintf("[%s %s]: %s\n", c.Nickname, timestamp, body)
 		} else {
-			n.SafePrintf("\n%s От %s:\n", Style.Mail, c.Nickname)
-			n.SafePrintf("[%s %s]: %s\n", c.Nickname, timestamp, body)
+			n.SafePrintf("\n%s [%s %s]: %s\n", Style.Mail, c.Nickname, timestamp, body)
 		}
 	}
 }
@@ -1644,12 +1623,12 @@ func (n *Node) SendChatMessage(peerID peer.ID, text string) {
 	c.mu.Unlock()
 
 	if state != StateActive {
-		n.SafePrintf("%s %s еще не принял запрос\n", Style.Warning, c.Nickname)
+		n.SafePrintf("%s Чат не активен\n", Style.Warning)
 		return
 	}
 
 	if err := n.sendSessionMessage(c, MsgTypeText, text); err != nil {
-		n.SafePrintf("%s Ошибка отправки: %v\n", Style.Fail, err)
+		n.SafePrintf("%s Ошибка: %v\n", Style.Fail, err)
 		return
 	}
 	n.SafePrintf("[Вы %s]: %s\n", time.Now().Format("15:04"), text)
@@ -1662,7 +1641,7 @@ func (n *Node) createHandshakeBytes(ephPub *[32]byte) ([]byte, error) {
 	var nonce int64
 
 	if err := binary.Read(rand.Reader, binary.LittleEndian, &nonce); err != nil {
-		return nil, fmt.Errorf("RNG failure: %w", err)
+		return nil, err
 	}
 
 	payload := HandshakePayload{
@@ -1682,7 +1661,7 @@ func (n *Node) createHandshakeBytes(ephPub *[32]byte) ([]byte, error) {
 
 	sig, err := privKey.Sign(buf.Bytes())
 	if err != nil {
-		return nil, fmt.Errorf("signing failed: %w", err)
+		return nil, err
 	}
 	payload.Signature = sig
 
@@ -1691,7 +1670,7 @@ func (n *Node) createHandshakeBytes(ephPub *[32]byte) ([]byte, error) {
 
 func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 	if len(data) > HandshakeLimit {
-		return nil, errors.New("payload too large")
+		return nil, errors.New("too large")
 	}
 
 	var payload HandshakePayload
@@ -1700,17 +1679,17 @@ func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 	}
 
 	if payload.Version != ProtocolVersion {
-		return nil, fmt.Errorf("version mismatch: %s vs %s", payload.Version, ProtocolVersion)
+		return nil, fmt.Errorf("version: %s", payload.Version)
 	}
 
 	if len(payload.EphemeralPub) != 32 {
-		return nil, errors.New("invalid ephemeral key size")
+		return nil, errors.New("bad eph key")
 	}
 
 	now := time.Now()
 	ts := time.Unix(0, payload.Timestamp)
 	if now.Sub(ts) > MaxTimeSkew || ts.Sub(now) > MaxTimeSkew {
-		return nil, errors.New("timestamp skew")
+		return nil, errors.New("time skew")
 	}
 
 	c.mu.Lock()
@@ -1724,18 +1703,18 @@ func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 	}
 	if len(c.SeenNonces) >= MaxNoncesPerContact {
 		c.mu.Unlock()
-		return nil, errors.New("handshake flood")
+		return nil, errors.New("flood")
 	}
 	if _, exists := c.SeenNonces[payload.Nonce]; exists {
 		c.mu.Unlock()
-		return nil, errors.New("replay detected")
+		return nil, errors.New("replay")
 	}
 	c.SeenNonces[payload.Nonce] = time.Now()
 	c.mu.Unlock()
 
 	remotePub := n.host.Peerstore().PubKey(c.PeerID)
 	if remotePub == nil {
-		return nil, errors.New("no public key for peer")
+		return nil, errors.New("no key")
 	}
 
 	buf := new(bytes.Buffer)
@@ -1747,13 +1726,13 @@ func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 
 	ok, _ := remotePub.Verify(buf.Bytes(), payload.Signature)
 	if !ok {
-		return nil, errors.New("signature invalid")
+		return nil, errors.New("bad sig")
 	}
 
 	var recKey [32]byte
 	copy(recKey[:], payload.NaClPubKey)
 	if recKey != c.PublicKey {
-		return nil, errors.New("static key mismatch")
+		return nil, errors.New("key mismatch")
 	}
 
 	var ephPub [32]byte
@@ -1761,7 +1740,7 @@ func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 	return &ephPub, nil
 }
 
-// --- Session Messaging ---
+// --- Session ---
 
 func (n *Node) sendSessionMessage(c *Contact, msgType, body string) error {
 	c.mu.Lock()
@@ -1810,9 +1789,8 @@ func (n *Node) enterChat(id peer.ID) {
 	n.mu.Unlock()
 
 	n.updatePrompt()
-
 	n.drawBox(fmt.Sprintf("ЧАТ: %s", nick), []string{
-		"Forward Secrecy: ACTIVE",
+		"Forward Secrecy: ON",
 		".leave - выход",
 	})
 }
@@ -1834,7 +1812,7 @@ func (n *Node) LeaveChat() {
 	if c != nil {
 		n.sendSessionMessage(c, MsgTypeBye, "")
 		n.closeStream(c)
-		n.SafePrintf("%s Чат с %s завершен\n", Style.Arrow, c.Nickname)
+		n.SafePrintf("%s Чат завершён\n", Style.OK)
 	}
 }
 
@@ -1903,16 +1881,31 @@ func (n *Node) handleDisconnect(c *Contact, err error) {
 
 	if wasActive {
 		n.updatePrompt()
-		n.SafePrintf("\n%s %s отключился (сессия уничтожена)\n", Style.Warning, nick)
+		n.SafePrintf("\n%s %s отключился\n", Style.Warning, nick)
 	}
 }
 
 func (n *Node) Shutdown() {
-	n.SafePrintf("\n%s Завершение...\n", Style.Info)
+	n.shutdownMu.Lock()
+	if n.isShutdown {
+		n.shutdownMu.Unlock()
+		return
+	}
+	n.isShutdown = true
+	n.shutdownMu.Unlock()
+
+	fmt.Printf("\n%s Завершение...\n", Style.Info)
+
 	n.cancel()
 
-	close(n.presenceChan)
+	// Закрываем канал
+	select {
+	case <-n.presenceChan:
+	default:
+		close(n.presenceChan)
+	}
 
+	// Закрываем соединения
 	n.mu.RLock()
 	contacts := make([]*Contact, 0, len(n.contacts))
 	for _, c := range n.contacts {
@@ -1927,6 +1920,7 @@ func (n *Node) Shutdown() {
 
 	n.SaveContacts()
 
+	// Ждём goroutines с таймаутом
 	done := make(chan struct{})
 	go func() {
 		n.wg.Wait()
@@ -1935,7 +1929,7 @@ func (n *Node) Shutdown() {
 
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(ShutdownTimeout):
 	}
 
 	if n.rl != nil {
@@ -1974,10 +1968,10 @@ func (n *Node) ListContacts() {
 
 		if hasStream && state == StateActive && hasSession {
 			icon = Style.InChat
-			statusText = "В ЧАТЕ (FS)"
+			statusText = "В ЧАТЕ"
 		} else if hasStream && hasSession {
 			icon = Style.Connected
-			statusText = "CONNECTED (FS)"
+			statusText = "CONNECTED"
 		} else if state == StatePending {
 			icon = Style.Pending
 			statusText = "PENDING"
@@ -1987,19 +1981,19 @@ func (n *Node) ListContacts() {
 				icon = Style.Online
 				ago := time.Since(lastSeen).Round(time.Second)
 				if addrCount > 0 {
-					statusText = fmt.Sprintf("ONLINE (%d addr, %v)", addrCount, ago)
+					statusText = fmt.Sprintf("ONLINE (%d, %v)", addrCount, ago)
 				} else {
 					statusText = fmt.Sprintf("ONLINE (%v)", ago)
 				}
 			case PresenceOffline:
 				icon = Style.Offline
-				statusText = fmt.Sprintf("OFFLINE (fails: %d)", failCount)
+				statusText = fmt.Sprintf("OFFLINE (%d)", failCount)
 			case PresenceChecking:
 				icon = Style.Searching
-				statusText = "CHECKING..."
+				statusText = "..."
 			default:
 				icon = Style.Unknown
-				statusText = "UNKNOWN"
+				statusText = "?"
 			}
 		}
 
