@@ -3,9 +3,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/TheSiriuss/F2F-chat/pkg/f2f"
@@ -43,45 +40,94 @@ func (g *GUIAdapter) OnContactUpdate() {
 func (g *GUIAdapter) OnChatChanged(peerID, nick string) {
 	g.state.mu.Lock()
 	g.state.Messages = nil
+	// Сбрасываем файловое состояние при смене чата
+	g.state.FileTransfer = &FileTransferUI{}
 	g.state.mu.Unlock()
 	g.state.Window.Invalidate()
 }
 
 func (g *GUIAdapter) OnFileOffer(peerID, nick, filename string, size int64) {
+	g.state.mu.Lock()
+	g.state.FileTransfer.HasIncoming = true
+	g.state.FileTransfer.IncomingNick = nick
+	g.state.FileTransfer.IncomingName = filename
+	g.state.FileTransfer.IncomingSize = size
+	g.state.mu.Unlock()
+
 	g.OnLog(f2f.LogLevelInfo, "%s предлагает файл: %s (%s)", nick, filename, formatSize(size))
-	// TODO: показать диалог в GUI
+	g.state.Window.Invalidate()
 }
 
 func (g *GUIAdapter) OnFileProgress(peerID, nick, filename string, progress float64, isUpload bool) {
-	// TODO: показать прогресс-бар в GUI
+	g.state.mu.Lock()
+	g.state.FileTransfer.IsActive = true
+	g.state.FileTransfer.IsUpload = isUpload
+	g.state.FileTransfer.FileName = filename
+	g.state.FileTransfer.Progress = progress
+
+	if isUpload {
+		g.state.FileTransfer.StatusText = fmt.Sprintf("Отправка: %.0f%%", progress*100)
+	} else {
+		g.state.FileTransfer.StatusText = fmt.Sprintf("Получение: %.0f%%", progress*100)
+	}
+	g.state.mu.Unlock()
+	g.state.Window.Invalidate()
 }
 
 func (g *GUIAdapter) OnFileReceived(peerID, nick, filename, savedPath string, size int64) {
-	g.OnLog(f2f.LogLevelSuccess, "Файл от %s сохранён: %s (%s)", nick, savedPath, formatSize(size))
+	g.state.mu.Lock()
+	// Добавляем сообщение в чат
+	g.state.Messages = append(g.state.Messages, UIMessage{
+		Sender:   nick,
+		Text:     fmt.Sprintf("📁 Файл получен: %s (%s)", filename, formatSize(size)),
+		Time:     time.Now(),
+		IsFile:   true,
+		FileName: savedPath,
+	})
+
+	// Сбрасываем состояние передачи
+	g.state.FileTransfer.IsActive = false
+	g.state.FileTransfer.HasIncoming = false
+	g.state.FileTransfer.ShowResult = true
+	g.state.FileTransfer.ResultSuccess = true
+	g.state.FileTransfer.ResultMessage = fmt.Sprintf("Сохранено: %s", savedPath)
+	g.state.FileTransfer.ResultTime = time.Now()
+	g.state.mu.Unlock()
+
+	g.OnLog(f2f.LogLevelSuccess, "Файл от %s сохранён: %s", nick, savedPath)
+	g.state.Window.Invalidate()
 }
 
 func (g *GUIAdapter) OnFileComplete(peerID, nick, filename string, success bool, message string) {
+	g.state.mu.Lock()
+	g.state.FileTransfer.IsActive = false
+	g.state.FileTransfer.HasIncoming = false
+	g.state.FileTransfer.ShowResult = true
+	g.state.FileTransfer.ResultSuccess = success
+	g.state.FileTransfer.ResultMessage = message
+	g.state.FileTransfer.ResultTime = time.Now()
+
+	// Добавляем сообщение в чат
+	var msgText string
+	if success {
+		msgText = fmt.Sprintf("✅ Файл '%s': %s", filename, message)
+	} else {
+		msgText = fmt.Sprintf("❌ Файл '%s': %s", filename, message)
+	}
+	g.state.Messages = append(g.state.Messages, UIMessage{
+		Sender: "System",
+		Text:   msgText,
+		Time:   time.Now(),
+		IsFile: true,
+	})
+	g.state.mu.Unlock()
+
 	if success {
 		g.OnLog(f2f.LogLevelSuccess, "Передача '%s' завершена: %s", filename, message)
 	} else {
 		g.OnLog(f2f.LogLevelError, "Передача '%s' не удалась: %s", filename, message)
 	}
-}
-
-// Legacy метод для совместимости (если где-то используется)
-func (g *GUIAdapter) OnFileReceivedLegacy(peerID, nick, filename string, data []byte, timestamp time.Time) {
-	g.OnLog(f2f.LogLevelInfo, "Получен файл '%s' от %s (%d bytes)", filename, nick, len(data))
-
-	savePath := filename
-	if _, err := os.Stat(savePath); err == nil {
-		ext := filepath.Ext(filename)
-		base := strings.TrimSuffix(filename, ext)
-		savePath = fmt.Sprintf("%s_%s%s", base, timestamp.Format("150405"), ext)
-	}
-
-	if err := os.WriteFile(savePath, data, 0644); err != nil {
-		g.OnLog(f2f.LogLevelError, "Ошибка сохранения: %v", err)
-	}
+	g.state.Window.Invalidate()
 }
 
 // formatSize форматирует размер файла
