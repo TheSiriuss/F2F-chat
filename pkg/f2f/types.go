@@ -1,6 +1,7 @@
-package main
+package f2f
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -13,9 +14,10 @@ import (
 type ChatState int
 
 const (
-	StateIdle ChatState = iota
-	StatePending
-	StateActive
+	StateIdle            ChatState = iota
+	StatePendingIncoming           // Мне прислали запрос
+	StatePendingOutgoing           // Я отправил запрос
+	StateActive                    // Чат активен
 )
 
 type PresenceStatus int
@@ -47,6 +49,7 @@ const (
 	MsgTypeRequest   = "req"
 	MsgTypeAccept    = "acc"
 	MsgTypeDecline   = "dec"
+	MsgTypeCancel    = "can" // НОВОЕ: отмена исходящего запроса
 	MsgTypeText      = "txt"
 	MsgTypePing      = "png"
 	MsgTypeBye       = "bye"
@@ -83,6 +86,10 @@ type Contact struct {
 	Stream          network.Stream `json:"-"`
 	Connecting      bool           `json:"-"`
 	LastConnectTime time.Time      `json:"-"`
+
+	// Контекст для отмены connecting
+	connectCtx    context.Context    `json:"-"`
+	connectCancel context.CancelFunc `json:"-"`
 
 	Presence      PresenceStatus `json:"-"`
 	LastSeen      time.Time      `json:"-"`

@@ -1,4 +1,4 @@
-package main
+package f2f
 
 import (
 	"context"
@@ -13,9 +13,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 )
 
-// --- Framing ---
-
-// writeFrame writes length-prefixed data to stream
 func (n *Node) writeFrame(s network.Stream, data []byte) error {
 	buf := make([]byte, 4+len(data))
 	binary.BigEndian.PutUint32(buf[:4], uint32(len(data)))
@@ -24,7 +21,6 @@ func (n *Node) writeFrame(s network.Stream, data []byte) error {
 	return err
 }
 
-// readFrame reads length-prefixed data from stream
 func (n *Node) readFrame(s network.Stream) ([]byte, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(s, header); err != nil {
@@ -41,111 +37,136 @@ func (n *Node) readFrame(s network.Stream) ([]byte, error) {
 	return buf, nil
 }
 
-// --- Connection Management ---
-
-// InitConnect initiates connection to a contact
 func (n *Node) InitConnect(nickname string) {
 	c := n.getContactByNick(nickname)
 	if c == nil {
-		n.SafePrintf("%s Контакт '%s' не найден\n", Style.Fail, nickname)
+		n.Log(LogLevelError, "Контакт '%s' не найден", nickname)
 		return
 	}
 
 	c.mu.Lock()
 	if c.Stream != nil {
 		c.mu.Unlock()
-		n.SafePrintf("%s Уже подключены к %s\n", Style.Warning, nickname)
-		n.enterChat(c.PeerID)
+		n.Log(LogLevelWarning, "Уже подключены к %s", nickname)
+		n.EnterChat(c.PeerID)
 		return
 	}
 	if c.Connecting {
 		c.mu.Unlock()
-		n.SafePrintf("%s Подключение в процессе\n", Style.Warning)
 		return
 	}
 	c.Connecting = true
+
+	// Создаём контекст с возможностью отмены
+	ctx, cancel := context.WithCancel(n.ctx)
+	c.connectCtx = ctx
+	c.connectCancel = cancel
 	c.mu.Unlock()
+	n.listener.OnContactUpdate()
 
 	defer func() {
 		c.mu.Lock()
 		c.Connecting = false
+		c.connectCtx = nil
+		c.connectCancel = nil
 		c.mu.Unlock()
+		n.listener.OnContactUpdate()
 	}()
 
-	// Find peer if not connected
+	// Проверяем отмену перед поиском
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
 	if n.host.Network().Connectedness(c.PeerID) != network.Connected {
-		n.SafePrintf("%s Поиск %s...\n", Style.Searching, nickname)
-		ctxT, cancel := context.WithTimeout(n.ctx, PeerLookupTimeout)
-		defer cancel()
+		n.Log(LogLevelInfo, "Поиск %s...", nickname)
+		ctxT, cancelT := context.WithTimeout(ctx, PeerLookupTimeout)
+		defer cancelT()
 
 		info, err := n.dht.FindPeer(ctxT, c.PeerID)
 		if err == nil && len(info.Addrs) > 0 {
 			n.host.Peerstore().AddAddrs(c.PeerID, info.Addrs, peerstore.PermanentAddrTTL)
-			n.SafePrintf("%s Найдено %d адресов\n", Style.OK, len(info.Addrs))
+		}
+
+		// Проверяем отмену после поиска
+		select {
+		case <-ctx.Done():
+			n.Log(LogLevelInfo, "Подключение отменено")
+			return
+		default:
 		}
 	}
 
-	// Open stream
-	streamCtx, streamCancel := context.WithTimeout(n.ctx, NewStreamTimeout)
+	streamCtx, streamCancel := context.WithTimeout(ctx, NewStreamTimeout)
 	defer streamCancel()
 
 	s, err := n.host.NewStream(streamCtx, c.PeerID, ProtocolID)
 	if err != nil {
-		n.SafePrintf("%s Ошибка подключения: %v\n", Style.Fail, err)
+		// Проверяем - была ли это отмена
+		select {
+		case <-ctx.Done():
+			n.Log(LogLevelInfo, "Подключение отменено")
+		default:
+			n.Log(LogLevelError, "Ошибка подключения: %v", err)
+		}
 		return
+	}
+
+	// Ещё раз проверяем отмену после создания стрима
+	select {
+	case <-ctx.Done():
+		s.Close()
+		n.Log(LogLevelInfo, "Подключение отменено")
+		return
+	default:
 	}
 
 	c.mu.Lock()
 	if c.Stream != nil {
 		s.Close()
 		c.mu.Unlock()
-		n.enterChat(c.PeerID)
+		n.EnterChat(c.PeerID)
 		return
 	}
 	c.Stream = s
 	c.Presence = PresenceOnline
 	c.LastSeen = time.Now()
 	c.FailCount = 0
-	c.mu.Unlock()
 
-	// Generate ephemeral keys
 	ephPriv, ephPub, err := generateEphemeralKeys()
 	if err != nil {
-		n.SafePrintf("%s Ошибка ключей\n", Style.Fail)
+		c.mu.Unlock()
 		n.closeStream(c)
 		return
 	}
-
-	c.mu.Lock()
 	c.localEphPriv = ephPriv
 	c.localEphPub = ephPub
 	c.mu.Unlock()
 
-	// Send handshake
 	hsBytes, err := n.createHandshakeBytes(ephPub)
 	if err != nil {
-		n.SafePrintf("%s Ошибка handshake\n", Style.Fail)
 		n.closeStream(c)
 		return
 	}
 
 	if err := n.writeFrame(s, hsBytes); err != nil {
-		n.SafePrintf("%s Ошибка отправки\n", Style.Fail)
 		n.closeStream(c)
 		return
 	}
 
 	c.mu.Lock()
-	c.State = StatePending
+	c.State = StatePendingOutgoing
 	c.mu.Unlock()
 
-	n.SafePrintf("%s Ожидание ответа...\n", Style.OK)
+	n.Log(LogLevelSuccess, "Отправлен запрос %s...", nickname)
+	n.listener.OnContactUpdate()
 
 	n.wg.Add(1)
 	go n.readLoop(c, true)
 }
 
-// handleStream handles incoming streams
 func (n *Node) handleStream(s network.Stream) {
 	remoteID := s.Conn().RemotePeer()
 	c := n.getContactByID(remoteID)
@@ -156,7 +177,6 @@ func (n *Node) handleStream(s network.Stream) {
 
 	c.mu.Lock()
 	if c.Stream != nil {
-		// Resolve conflict: lower ID keeps existing
 		localID := n.host.ID()
 		if localID.String() < remoteID.String() {
 			c.mu.Unlock()
@@ -171,21 +191,18 @@ func (n *Node) handleStream(s network.Stream) {
 	c.Presence = PresenceOnline
 	c.LastSeen = time.Now()
 	c.FailCount = 0
-	c.mu.Unlock()
 
-	// Generate ephemeral keys
 	ephPriv, ephPub, err := generateEphemeralKeys()
 	if err != nil {
+		c.mu.Unlock()
 		n.closeStream(c)
 		return
 	}
-
-	c.mu.Lock()
 	c.localEphPriv = ephPriv
 	c.localEphPub = ephPub
 	c.mu.Unlock()
+	n.listener.OnContactUpdate()
 
-	// Send handshake
 	hsBytes, err := n.createHandshakeBytes(ephPub)
 	if err != nil {
 		n.closeStream(c)
@@ -201,7 +218,6 @@ func (n *Node) handleStream(s network.Stream) {
 	go n.readLoop(c, false)
 }
 
-// readLoop reads messages from stream
 func (n *Node) readLoop(c *Contact, isInitiator bool) {
 	defer n.wg.Done()
 	defer n.handleDisconnect(c, nil)
@@ -214,7 +230,6 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 		return
 	}
 
-	// Read handshake
 	s.SetReadDeadline(time.Now().Add(HandshakeTimeout))
 	hsData, err := n.readFrame(s)
 	if err != nil {
@@ -223,14 +238,12 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 
 	remoteEphPub, err := n.verifyHandshake(c, hsData)
 	if err != nil {
-		n.SafePrintf("%s Ошибка handshake: %v\n", Style.Fail, err)
+		n.Log(LogLevelError, "Handshake fail: %v", err)
 		return
 	}
 
-	// Derive session key
 	c.mu.Lock()
 	c.remoteEphPub = remoteEphPub
-
 	sessionKey, err := deriveSessionKey(c.localEphPriv, c.localEphPub, remoteEphPub)
 	if err != nil {
 		c.mu.Unlock()
@@ -238,15 +251,10 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 	}
 	c.sessionKey = sessionKey
 	c.sessionEstab = true
-
-	// Zero ephemeral private key
-	for i := range c.localEphPriv {
-		c.localEphPriv[i] = 0
-	}
 	c.localEphPriv = nil
 	c.mu.Unlock()
+	n.listener.OnContactUpdate()
 
-	// Send request if initiator
 	if isInitiator {
 		if err := n.sendSessionMessage(c, MsgTypeRequest, ""); err != nil {
 			return
@@ -255,7 +263,6 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 
 	go n.SaveContacts()
 
-	// Message loop
 	for {
 		c.mu.Lock()
 		if c.Stream != s {
@@ -280,7 +287,6 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 			continue
 		}
 
-		// Validate timestamp
 		now := time.Now().UnixNano()
 		if msg.Timestamp > now+int64(MaxTimeSkew) {
 			continue
@@ -294,7 +300,11 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 		c.LastMsgTime = msg.Timestamp
 		c.mu.Unlock()
 
-		if msg.Type == MsgTypeBye {
+		// Обрабатываем Cancel и Bye как сигнал завершения
+		if msg.Type == MsgTypeBye || msg.Type == MsgTypeCancel {
+			if msg.Type == MsgTypeCancel {
+				n.Log(LogLevelInfo, "%s отменил запрос", c.Nickname)
+			}
 			return
 		}
 		if msg.Type == MsgTypePing {
@@ -309,7 +319,6 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 	}
 }
 
-// processMessage handles received messages
 func (n *Node) processMessage(c *Contact, msgType string, ts int64, body string) {
 	switch msgType {
 	case MsgTypeRequest:
@@ -318,21 +327,28 @@ func (n *Node) processMessage(c *Contact, msgType string, ts int64, body string)
 			c.mu.Unlock()
 			return
 		}
-		c.State = StatePending
+		c.State = StatePendingIncoming
 		c.mu.Unlock()
-		n.SafePrintf("\n%s Запрос от %s! (.accept %s / .decline %s)\n",
-			Style.Bell, c.Nickname, c.Nickname, c.Nickname)
+		n.Log(LogLevelWarning, "Запрос от %s! (.accept / .decline)", c.Nickname)
+		n.listener.OnContactUpdate()
 
 	case MsgTypeAccept:
 		c.mu.Lock()
+		// Проверяем что мы ещё ждём ответа
+		if c.State != StatePendingOutgoing {
+			c.mu.Unlock()
+			return
+		}
 		c.State = StateActive
 		c.mu.Unlock()
-		n.SafePrintf("\n%s %s принял!\n", Style.OK, c.Nickname)
-		n.enterChat(c.PeerID)
+		n.Log(LogLevelSuccess, "%s принял запрос!", c.Nickname)
+		n.EnterChat(c.PeerID)
+		n.listener.OnContactUpdate()
 
 	case MsgTypeDecline:
 		n.closeStream(c)
-		n.SafePrintf("\n%s %s отклонил\n", Style.Fail, c.Nickname)
+		n.Log(LogLevelError, "%s отклонил запрос", c.Nickname)
+		n.listener.OnContactUpdate()
 
 	case MsgTypeText:
 		c.mu.Lock()
@@ -341,21 +357,11 @@ func (n *Node) processMessage(c *Contact, msgType string, ts int64, body string)
 		if !isActive {
 			return
 		}
-
-		timestamp := time.Unix(0, ts).Format("15:04")
-		n.mu.RLock()
-		active := n.activeChat == c.PeerID
-		n.mu.RUnlock()
-
-		if active {
-			n.SafePrintf("[%s %s]: %s\n", c.Nickname, timestamp, body)
-		} else {
-			n.SafePrintf("\n%s [%s %s]: %s\n", Style.Mail, c.Nickname, timestamp, body)
-		}
+		timestamp := time.Unix(0, ts)
+		n.listener.OnMessage(c.PeerID.String(), c.Nickname, body, timestamp)
 	}
 }
 
-// sendSessionMessage sends encrypted message over session
 func (n *Node) sendSessionMessage(c *Contact, msgType, body string) error {
 	c.mu.Lock()
 	s := c.Stream
@@ -380,18 +386,10 @@ func (n *Node) sendSessionMessage(c *Contact, msgType, body string) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	c.mu.Lock()
-	if c.Stream != s {
-		c.mu.Unlock()
-		return errors.New("stream changed")
-	}
-	c.mu.Unlock()
-
 	s.SetWriteDeadline(time.Now().Add(WriteTimeout))
 	return n.writeFrame(s, encrypted)
 }
 
-// closeStream closes stream and cleans up session
 func (n *Node) closeStream(c *Contact) {
 	c.mu.Lock()
 	if c.Stream != nil {
@@ -400,56 +398,30 @@ func (n *Node) closeStream(c *Contact) {
 	}
 	c.State = StateIdle
 	c.Connecting = false
-
-	// Zero sensitive data
-	if c.sessionKey != nil {
-		for i := range c.sessionKey {
-			c.sessionKey[i] = 0
-		}
-		c.sessionKey = nil
-	}
-	if c.localEphPriv != nil {
-		for i := range c.localEphPriv {
-			c.localEphPriv[i] = 0
-		}
-		c.localEphPriv = nil
-	}
+	c.sessionKey = nil
+	c.localEphPriv = nil
 	c.localEphPub = nil
 	c.remoteEphPub = nil
 	c.sessionEstab = false
+
+	// Отменяем контекст подключения если есть
+	if c.connectCancel != nil {
+		c.connectCancel()
+		c.connectCancel = nil
+		c.connectCtx = nil
+	}
 	c.mu.Unlock()
+
+	n.listener.OnContactUpdate()
 }
 
-// handleDisconnect handles peer disconnection
 func (n *Node) handleDisconnect(c *Contact, err error) {
 	c.mu.Lock()
 	nick := c.Nickname
 	pid := c.PeerID
-
-	if c.Stream != nil {
-		c.Stream.Close()
-		c.Stream = nil
-	}
-	c.State = StateIdle
-	c.Connecting = false
-
-	// Zero sensitive data
-	if c.sessionKey != nil {
-		for i := range c.sessionKey {
-			c.sessionKey[i] = 0
-		}
-		c.sessionKey = nil
-	}
-	if c.localEphPriv != nil {
-		for i := range c.localEphPriv {
-			c.localEphPriv[i] = 0
-		}
-		c.localEphPriv = nil
-	}
-	c.localEphPub = nil
-	c.remoteEphPub = nil
-	c.sessionEstab = false
 	c.mu.Unlock()
+
+	n.closeStream(c)
 
 	n.mu.Lock()
 	wasActive := n.activeChat == pid
@@ -459,31 +431,29 @@ func (n *Node) handleDisconnect(c *Contact, err error) {
 	n.mu.Unlock()
 
 	if wasActive {
-		n.updatePrompt()
-		n.SafePrintf("\n%s %s отключился\n", Style.Warning, nick)
+		n.listener.OnChatChanged("", "")
+		n.Log(LogLevelWarning, "%s отключился", nick)
 	}
 }
 
-// SendChatMessage sends a text message in active chat
 func (n *Node) SendChatMessage(peerID peer.ID, text string) {
 	c := n.getContactByID(peerID)
 	if c == nil {
 		n.LeaveChat()
 		return
 	}
-
 	c.mu.Lock()
 	state := c.State
 	c.mu.Unlock()
 
 	if state != StateActive {
-		n.SafePrintf("%s Чат не активен\n", Style.Warning)
+		n.Log(LogLevelWarning, "Чат не активен")
 		return
 	}
 
 	if err := n.sendSessionMessage(c, MsgTypeText, text); err != nil {
-		n.SafePrintf("%s Ошибка: %v\n", Style.Fail, err)
+		n.Log(LogLevelError, "Ошибка отправки: %v", err)
 		return
 	}
-	n.SafePrintf("[Вы %s]: %s\n", time.Now().Format("15:04"), text)
+	n.listener.OnMessage(n.host.ID().String(), n.nickname, text, time.Now())
 }

@@ -1,4 +1,4 @@
-package main
+package f2f
 
 import (
 	"context"
@@ -9,22 +9,16 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 )
 
-// presenceLoop periodically queues presence checks
 func (n *Node) presenceLoop() {
 	defer n.wg.Done()
-
-	// Initial delay
 	select {
 	case <-time.After(10 * time.Second):
 	case <-n.ctx.Done():
 		return
 	}
-
 	n.QueuePresenceChecks()
-
 	ticker := time.NewTicker(PresenceInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-n.ctx.Done():
@@ -35,10 +29,8 @@ func (n *Node) presenceLoop() {
 	}
 }
 
-// presenceWorkerPool processes presence check requests
 func (n *Node) presenceWorkerPool() {
 	defer n.wg.Done()
-
 	for {
 		select {
 		case <-n.ctx.Done():
@@ -52,7 +44,6 @@ func (n *Node) presenceWorkerPool() {
 	}
 }
 
-// ForceCheckAll resets and queues all contacts for presence check
 func (n *Node) ForceCheckAll() {
 	n.mu.RLock()
 	contacts := make([]*Contact, 0, len(n.contacts))
@@ -68,15 +59,14 @@ func (n *Node) ForceCheckAll() {
 		c.Presence = PresenceChecking
 		pid := c.PeerID
 		c.mu.Unlock()
-
 		select {
 		case n.presenceChan <- pid:
 		default:
 		}
 	}
+	n.listener.OnContactUpdate()
 }
 
-// QueuePresenceChecks queues contacts that need presence check
 func (n *Node) QueuePresenceChecks() {
 	n.mu.RLock()
 	contacts := make([]*Contact, 0, len(n.contacts))
@@ -85,9 +75,9 @@ func (n *Node) QueuePresenceChecks() {
 	}
 	n.mu.RUnlock()
 
+	needUpdate := false
 	for _, c := range contacts {
 		c.mu.Lock()
-		// Skip if already connected
 		if c.Stream != nil {
 			c.Presence = PresenceOnline
 			c.LastSeen = time.Now()
@@ -95,15 +85,13 @@ func (n *Node) QueuePresenceChecks() {
 			c.mu.Unlock()
 			continue
 		}
-
-		// Skip if not time yet
 		if time.Now().Before(c.NextCheckTime) {
 			c.mu.Unlock()
 			continue
 		}
-
 		c.Presence = PresenceChecking
 		pid := c.PeerID
+		needUpdate = true
 		c.mu.Unlock()
 
 		select {
@@ -111,16 +99,16 @@ func (n *Node) QueuePresenceChecks() {
 		default:
 		}
 	}
+	if needUpdate {
+		n.listener.OnContactUpdate()
+	}
 }
 
-// checkSinglePresence checks presence of a single peer
 func (n *Node) checkSinglePresence(pid peer.ID) {
 	c := n.getContactByID(pid)
 	if c == nil {
 		return
 	}
-
-	// Check if already connected at network level
 	if n.host.Network().Connectedness(pid) == network.Connected {
 		c.mu.Lock()
 		c.Presence = PresenceOnline
@@ -128,52 +116,45 @@ func (n *Node) checkSinglePresence(pid peer.ID) {
 		c.FailCount = 0
 		c.NextCheckTime = time.Now().Add(PresenceInterval)
 		c.mu.Unlock()
+		n.listener.OnContactUpdate()
 		return
 	}
 
-	// Query DHT
 	ctx, cancel := context.WithTimeout(n.ctx, PresenceTimeout)
 	defer cancel()
-
 	info, err := n.dht.FindPeer(ctx, pid)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.LastChecked = time.Now()
-
 	if err != nil {
 		c.Presence = PresenceOffline
 		c.FailCount++
-		// Exponential backoff
 		backoff := time.Duration(30*(1<<c.FailCount)) * time.Second
 		if backoff > MaxPresenceBackoff {
 			backoff = MaxPresenceBackoff
 		}
 		c.NextCheckTime = time.Now().Add(backoff)
-		return
+	} else {
+		c.Presence = PresenceOnline
+		c.LastSeen = time.Now()
+		c.AddressCount = len(info.Addrs)
+		c.FailCount = 0
+		c.NextCheckTime = time.Now().Add(PresenceInterval)
+		if len(info.Addrs) > 0 {
+			n.host.Peerstore().AddAddrs(pid, info.Addrs, peerstore.TempAddrTTL)
+		}
 	}
-
-	c.Presence = PresenceOnline
-	c.LastSeen = time.Now()
-	c.AddressCount = len(info.Addrs)
-	c.FailCount = 0
-	c.NextCheckTime = time.Now().Add(PresenceInterval)
-
-	// Cache addresses
-	if len(info.Addrs) > 0 {
-		n.host.Peerstore().AddAddrs(pid, info.Addrs, peerstore.TempAddrTTL)
-	}
+	c.mu.Unlock()
+	n.listener.OnContactUpdate()
 }
 
-// FindContact manually searches for a contact in DHT
 func (n *Node) FindContact(nick string) {
 	c := n.getContactByNick(nick)
 	if c == nil {
-		n.SafePrintf("%s Контакт '%s' не найден\n", Style.Fail, nick)
+		n.Log(LogLevelError, "Контакт '%s' не найден", nick)
 		return
 	}
-
-	n.SafePrintf("%s Поиск %s в DHT...\n", Style.Searching, nick)
+	n.Log(LogLevelInfo, "Поиск %s в DHT...", nick)
 
 	ctx, cancel := context.WithTimeout(n.ctx, PresenceTimeout)
 	defer cancel()
@@ -182,24 +163,19 @@ func (n *Node) FindContact(nick string) {
 	info, err := n.dht.FindPeer(ctx, c.PeerID)
 	elapsed := time.Since(start)
 
-	if err != nil {
-		n.SafePrintf("%s %s не найден (%.1fs)\n", Style.Fail, nick, elapsed.Seconds())
-		c.mu.Lock()
-		c.Presence = PresenceOffline
-		c.LastChecked = time.Now()
-		c.mu.Unlock()
-		return
-	}
-
-	n.SafePrintf("%s %s найден! (%d адресов, %.1fs)\n", Style.OK, nick, len(info.Addrs), elapsed.Seconds())
-
 	c.mu.Lock()
-	c.Presence = PresenceOnline
-	c.LastSeen = time.Now()
-	c.AddressCount = len(info.Addrs)
 	c.LastChecked = time.Now()
-	c.FailCount = 0
+	if err != nil {
+		n.Log(LogLevelError, "%s не найден (%.1fs)", nick, elapsed.Seconds())
+		c.Presence = PresenceOffline
+	} else {
+		n.Log(LogLevelSuccess, "%s найден! (%d адресов, %.1fs)", nick, len(info.Addrs), elapsed.Seconds())
+		c.Presence = PresenceOnline
+		c.LastSeen = time.Now()
+		c.AddressCount = len(info.Addrs)
+		c.FailCount = 0
+		n.host.Peerstore().AddAddrs(c.PeerID, info.Addrs, peerstore.PermanentAddrTTL)
+	}
 	c.mu.Unlock()
-
-	n.host.Peerstore().AddAddrs(c.PeerID, info.Addrs, peerstore.PermanentAddrTTL)
+	n.listener.OnContactUpdate()
 }

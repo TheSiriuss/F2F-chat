@@ -1,4 +1,4 @@
-package main
+package f2f
 
 import (
 	"bytes"
@@ -216,10 +216,9 @@ func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 	return &ephPub, nil
 }
 
-// --- Fingerprint ---
-
-// computeFingerprint generates human-readable key fingerprint
-func computeFingerprint(pubKey []byte) string {
+// ComputeFingerprint generates human-readable key fingerprint
+// Exported so UI can use it
+func ComputeFingerprint(pubKey []byte) string {
 	hash := sha256.Sum256(pubKey)
 	hex := fmt.Sprintf("%X", hash[:8])
 	return fmt.Sprintf("%s-%s-%s-%s", hex[0:4], hex[4:8], hex[8:12], hex[12:16])
