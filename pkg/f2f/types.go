@@ -2,6 +2,8 @@ package f2f
 
 import (
 	"context"
+	"hash"
+	"os"
 	"sync"
 	"time"
 
@@ -108,15 +110,17 @@ type FileTransfer struct {
 	ID          string
 	Name        string
 	Size        int64
-	FilePath    string // для исходящих - путь к файлу
-	Buffer      []byte // для входящих - накопленные данные
-	Received    int64  // байт получено
-	ChunksSent  int    // чанков отправлено (для исходящих)
-	ChunksRecv  int    // чанков получено (для входящих)
-	TotalChunks int    // всего чанков
+	FilePath    string    // для исходящих - путь к файлу
+	TempPath    string    // для входящих - путь к temp файлу
+	TempFile    *os.File  // для входящих - открытый temp файл
+	Hasher      hash.Hash // для вычисления хеша по ходу
+	Received    int64     // байт получено
+	ChunksSent  int
+	ChunksRecv  int
+	TotalChunks int
 	CreatedAt   time.Time
-	IsOutgoing  bool // true = мы отправляем
-	Cancelled   bool // отменена ли передача
+	IsOutgoing  bool
+	Cancelled   bool
 }
 
 // --- Contact ---

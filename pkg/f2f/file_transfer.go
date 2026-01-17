@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -92,7 +93,6 @@ func (n *Node) SendFile(peerID peer.ID, filePath string) error {
 func (n *Node) AcceptFile(nick string) error {
 	c := n.getContactByNick(nick)
 	if c == nil {
-		// Если ник не указан, ищем в активном чате
 		activeID := n.GetActiveChat()
 		if activeID == "" {
 			return errors.New("no active chat")
@@ -115,10 +115,18 @@ func (n *Node) AcceptFile(nick string) error {
 	}
 	fileID := pending.ID
 	fileName := pending.Name
-	fileSize := pending.Size
 
-	// Подготавливаем буфер
-	pending.Buffer = make([]byte, 0, fileSize)
+	// Создаём временный файл для записи
+	tempPath := fileName + ".tmp." + fileID[:8]
+	tempFile, err := os.Create(tempPath)
+	if err != nil {
+		c.mu.Unlock()
+		return fmt.Errorf("cannot create temp file: %w", err)
+	}
+
+	pending.TempFile = tempFile
+	pending.TempPath = tempPath
+	pending.Hasher = sha256.New()
 	c.mu.Unlock()
 
 	// Отправляем accept
@@ -126,10 +134,15 @@ func (n *Node) AcceptFile(nick string) error {
 	respJSON, _ := json.Marshal(resp)
 
 	if err := n.sendSessionMessage(c, MsgTypeFileAccept, string(respJSON)); err != nil {
+		tempFile.Close()
+		os.Remove(tempPath)
+		c.mu.Lock()
+		c.PendingFile = nil
+		c.mu.Unlock()
 		return err
 	}
 
-	n.Log(LogLevelSuccess, "Принят файл '%s' (%s), ожидание данных...", fileName, formatSize(fileSize))
+	n.Log(LogLevelSuccess, "Принят файл '%s' (%s), ожидание данных...", fileName, formatSize(pending.Size))
 	return nil
 }
 
@@ -156,6 +169,12 @@ func (n *Node) DeclineFile(nick string) error {
 	fileID := pending.ID
 	fileName := pending.Name
 	isOutgoing := pending.IsOutgoing
+
+	// Закрываем temp файл если есть
+	if pending.TempFile != nil {
+		pending.TempFile.Close()
+		os.Remove(pending.TempPath)
+	}
 	c.PendingFile = nil
 	c.mu.Unlock()
 
@@ -178,7 +197,7 @@ func (n *Node) DeclineFile(nick string) error {
 	return nil
 }
 
-// HasPendingFile проверяет есть ли pending файл у контакта в активном чате
+// HasPendingFile проверяет есть ли pending файл
 func (n *Node) HasPendingFile() (bool, bool, string, int64) {
 	activeID := n.GetActiveChat()
 	if activeID == "" {
@@ -198,27 +217,30 @@ func (n *Node) HasPendingFile() (bool, bool, string, int64) {
 	return true, c.PendingFile.IsOutgoing, c.PendingFile.Name, c.PendingFile.Size
 }
 
-// sendFileChunks отправляет файл чанками (вызывается после accept)
+// sendFileChunks отправляет файл чанками (потоково, без загрузки в память)
 func (n *Node) sendFileChunks(c *Contact, transfer *FileTransfer) {
-	// Читаем файл
-	data, err := os.ReadFile(transfer.FilePath)
+	// Открываем файл для чтения
+	file, err := os.Open(transfer.FilePath)
 	if err != nil {
-		n.listener.OnFileComplete(c.PeerID.String(), c.Nickname, transfer.Name, false, "read error: "+err.Error())
+		n.listener.OnFileComplete(c.PeerID.String(), c.Nickname, transfer.Name, false, "open error: "+err.Error())
 		c.mu.Lock()
 		c.PendingFile = nil
 		c.mu.Unlock()
 		return
 	}
+	defer file.Close()
 
-	// Вычисляем хеш
-	hash := sha256.Sum256(data)
-	hashHex := hex.EncodeToString(hash[:])
+	// Hasher для вычисления хеша по ходу чтения
+	hasher := sha256.New()
 
 	// Разбиваем на чанки
-	totalChunks := (len(data) + FileChunkSize - 1) / FileChunkSize
+	totalChunks := int((transfer.Size + FileChunkSize - 1) / FileChunkSize)
 	transfer.TotalChunks = totalChunks
 
 	n.Log(LogLevelInfo, "Отправка '%s' (%d чанков)...", transfer.Name, totalChunks)
+
+	// Буфер для одного чанка (переиспользуем)
+	chunkBuffer := make([]byte, FileChunkSize)
 
 	for i := 0; i < totalChunks; i++ {
 		// Проверяем отмену
@@ -229,12 +251,24 @@ func (n *Node) sendFileChunks(c *Contact, transfer *FileTransfer) {
 		}
 		c.mu.Unlock()
 
-		start := i * FileChunkSize
-		end := start + FileChunkSize
-		if end > len(data) {
-			end = len(data)
+		// Читаем чанк из файла
+		bytesRead, err := file.Read(chunkBuffer)
+		if err != nil && err != io.EOF {
+			n.listener.OnFileComplete(c.PeerID.String(), c.Nickname, transfer.Name, false, "read error: "+err.Error())
+			c.mu.Lock()
+			c.PendingFile = nil
+			c.mu.Unlock()
+			return
 		}
-		chunkData := data[start:end]
+
+		if bytesRead == 0 {
+			break
+		}
+
+		chunkData := chunkBuffer[:bytesRead]
+
+		// Обновляем хеш
+		hasher.Write(chunkData)
 
 		chunk := FileChunk{
 			ID:    transfer.ID,
@@ -257,7 +291,8 @@ func (n *Node) sendFileChunks(c *Contact, transfer *FileTransfer) {
 		n.listener.OnFileProgress(c.PeerID.String(), c.Nickname, transfer.Name, progress, true)
 	}
 
-	// Отправляем Done
+	// Отправляем Done с хешем
+	hashHex := hex.EncodeToString(hasher.Sum(nil))
 	done := FileDone{
 		ID:   transfer.ID,
 		Hash: hashHex,
@@ -281,7 +316,6 @@ func (n *Node) processFileOffer(c *Contact, body string) {
 	}
 
 	c.mu.Lock()
-	// Если уже есть pending - автоматически отклоняем
 	if c.PendingFile != nil {
 		c.mu.Unlock()
 		resp := FileResponse{ID: offer.ID}
@@ -318,7 +352,6 @@ func (n *Node) processFileAccept(c *Contact, body string) {
 	}
 	c.mu.Unlock()
 
-	// Запускаем отправку чанков
 	go n.sendFileChunks(c, pending)
 }
 
@@ -354,6 +387,12 @@ func (n *Node) processFileCancel(c *Contact, body string) {
 	}
 	fileName := pending.Name
 	pending.Cancelled = true
+
+	// Закрываем temp файл
+	if pending.TempFile != nil {
+		pending.TempFile.Close()
+		os.Remove(pending.TempPath)
+	}
 	c.PendingFile = nil
 	c.mu.Unlock()
 
@@ -361,7 +400,7 @@ func (n *Node) processFileCancel(c *Contact, body string) {
 	n.Log(LogLevelInfo, "%s отменил передачу '%s'", c.Nickname, fileName)
 }
 
-// processFileChunk обрабатывает чанк файла
+// processFileChunk обрабатывает чанк файла (пишет сразу на диск)
 func (n *Node) processFileChunk(c *Contact, body string) {
 	var chunk FileChunk
 	if err := json.Unmarshal([]byte(body), &chunk); err != nil {
@@ -375,13 +414,31 @@ func (n *Node) processFileChunk(c *Contact, body string) {
 		return
 	}
 
+	// Проверяем что temp файл открыт
+	if pending.TempFile == nil {
+		c.mu.Unlock()
+		return
+	}
+
 	data, err := base64.StdEncoding.DecodeString(chunk.Data)
 	if err != nil {
 		c.mu.Unlock()
 		return
 	}
 
-	pending.Buffer = append(pending.Buffer, data...)
+	// Пишем чанк на диск
+	_, err = pending.TempFile.Write(data)
+	if err != nil {
+		c.mu.Unlock()
+		n.Log(LogLevelError, "Ошибка записи файла: %v", err)
+		return
+	}
+
+	// Обновляем хеш
+	if pending.Hasher != nil {
+		pending.Hasher.Write(data)
+	}
+
 	pending.Received += int64(len(data))
 	pending.ChunksRecv = chunk.Index + 1
 	pending.TotalChunks = chunk.Total
@@ -407,39 +464,76 @@ func (n *Node) processFileDone(c *Contact, body string) {
 		return
 	}
 
-	data := pending.Buffer
 	fileName := pending.Name
+	tempPath := pending.TempPath
 	expectedHash := done.Hash
+	var actualHashHex string
+
+	// Получаем хеш
+	if pending.Hasher != nil {
+		actualHashHex = hex.EncodeToString(pending.Hasher.Sum(nil))
+	}
+
+	// Закрываем temp файл
+	if pending.TempFile != nil {
+		pending.TempFile.Close()
+	}
+
 	c.PendingFile = nil
 	c.mu.Unlock()
 
 	// Проверяем хеш
-	actualHash := sha256.Sum256(data)
-	actualHashHex := hex.EncodeToString(actualHash[:])
-
 	if actualHashHex != expectedHash {
+		os.Remove(tempPath)
 		n.listener.OnFileComplete(c.PeerID.String(), c.Nickname, fileName, false, "hash mismatch - file corrupted")
 		n.Log(LogLevelError, "Файл '%s' повреждён (хеш не совпадает)", fileName)
 		return
 	}
 
-	// Сохраняем файл
+	// Определяем финальный путь
 	savePath := fileName
-	// Избегаем перезаписи
 	if _, err := os.Stat(savePath); err == nil {
 		ext := filepath.Ext(fileName)
 		base := fileName[:len(fileName)-len(ext)]
 		savePath = fmt.Sprintf("%s_%s%s", base, time.Now().Format("150405"), ext)
 	}
 
-	if err := os.WriteFile(savePath, data, 0644); err != nil {
-		n.listener.OnFileComplete(c.PeerID.String(), c.Nickname, fileName, false, "save error: "+err.Error())
-		n.Log(LogLevelError, "Ошибка сохранения '%s': %v", fileName, err)
-		return
+	// Переименовываем temp -> final
+	if err := os.Rename(tempPath, savePath); err != nil {
+		// Если переименование не работает (разные диски), копируем
+		if err := copyFile(tempPath, savePath); err != nil {
+			os.Remove(tempPath)
+			n.listener.OnFileComplete(c.PeerID.String(), c.Nickname, fileName, false, "save error: "+err.Error())
+			n.Log(LogLevelError, "Ошибка сохранения '%s': %v", fileName, err)
+			return
+		}
+		os.Remove(tempPath)
 	}
 
-	n.listener.OnFileReceived(c.PeerID.String(), c.Nickname, fileName, savePath, int64(len(data)))
-	n.Log(LogLevelSuccess, "Файл '%s' сохранён как '%s' (%s)", fileName, savePath, formatSize(int64(len(data))))
+	// Получаем размер сохранённого файла
+	info, _ := os.Stat(savePath)
+	savedSize := info.Size()
+
+	n.listener.OnFileReceived(c.PeerID.String(), c.Nickname, fileName, savePath, savedSize)
+	n.Log(LogLevelSuccess, "Файл '%s' сохранён как '%s' (%s)", fileName, savePath, formatSize(savedSize))
+}
+
+// copyFile копирует файл (fallback если rename не работает)
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, sourceFile)
+	return err
 }
 
 // formatSize форматирует размер файла
