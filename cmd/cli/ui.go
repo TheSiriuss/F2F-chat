@@ -36,30 +36,75 @@ func (c *ConsoleAdapter) OnLog(level string, format string, args ...any) {
 
 func (c *ConsoleAdapter) OnMessage(peerID string, nick string, text string, timestamp time.Time) {
 	c.rl.Clean()
-	fmt.Printf("\n%s [%s %s]: %s\n", Style.Mail, nick, timestamp.Format("15:04"), text)
+	fmt.Printf("[%s %s] > %s\n", nick, timestamp.Format("15:04:05"), text)
+	c.rl.Refresh()
+}
+
+func (c *ConsoleAdapter) OnFileOffer(peerID string, nick string, filename string, size int64) {
+	c.rl.Clean()
+	fmt.Printf("\n%s %s предлагает файл: %s (%s)\n", Style.Bell, nick, filename, formatSize(size))
+	fmt.Printf("%s Используйте .getfile для принятия или .nofile для отклонения\n\n", Style.Info)
+	c.rl.Refresh()
+}
+
+func (c *ConsoleAdapter) OnFileProgress(peerID string, nick string, filename string, progress float64, isUpload bool) {
+	// Простой прогресс-бар в консоли
+	c.rl.Clean()
+
+	barWidth := 30
+	filled := int(progress * float64(barWidth))
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+
+	direction := "Получение"
+	if isUpload {
+		direction = "Отправка"
+	}
+
+	fmt.Printf("\r%s %s [%s] %.0f%%", direction, filename, bar, progress*100)
+
+	if progress >= 1.0 {
+		fmt.Println()
+	}
+	c.rl.Refresh()
+}
+
+func (c *ConsoleAdapter) OnFileReceived(peerID string, nick string, filename string, savedPath string, size int64) {
+	c.rl.Clean()
+	fmt.Printf("%s Файл от %s сохранён: %s (%s)\n", Style.Mail, nick, savedPath, formatSize(size))
+	c.rl.Refresh()
+}
+
+func (c *ConsoleAdapter) OnFileComplete(peerID string, nick string, filename string, success bool, message string) {
+	c.rl.Clean()
+	if success {
+		fmt.Printf("%s Передача '%s' завершена: %s\n", Style.OK, filename, message)
+	} else {
+		fmt.Printf("%s Передача '%s' не удалась: %s\n", Style.Fail, filename, message)
+	}
 	c.rl.Refresh()
 }
 
 func (c *ConsoleAdapter) OnContactUpdate() {
-	// В консоли мы не перерисовываем список автоматом, чтобы не мусорить
+	// В консоли не перерисовываем автоматом
 }
 
 func (c *ConsoleAdapter) OnChatChanged(peerID string, nick string) {
+	c.rl.Clean()
 	if nick != "" {
 		c.rl.SetPrompt(fmt.Sprintf("[%s] > ", nick))
+		fmt.Printf("\n%s Чат с %s. Forward Secrecy: ON\n", Style.Info, nick)
 	} else {
 		c.rl.SetPrompt("> ")
 	}
 	c.rl.Refresh()
 }
 
-// --- Вспомогательные функции отрисовки (вернули из старого проекта) ---
+// --- Вспомогательные функции ---
 
 func (c *ConsoleAdapter) DrawBox(title string, lines []string) {
 	c.rl.Clean()
 	defer c.rl.Refresh()
 
-	// Вычисляем ширину
 	contentWidth := 0
 	if title != "" {
 		contentWidth = visibleLen(title)
@@ -74,12 +119,10 @@ func (c *ConsoleAdapter) DrawBox(title string, lines []string) {
 		contentWidth = 40
 	}
 
-	// Верхняя рамка
 	fmt.Print("\n" + Style.TopLeft)
 	fmt.Print(strings.Repeat(Style.Horizontal, contentWidth+2))
 	fmt.Println(Style.TopRight)
 
-	// Заголовок
 	if title != "" {
 		tLen := visibleLen(title)
 		padding := (contentWidth - tLen) / 2
@@ -96,7 +139,6 @@ func (c *ConsoleAdapter) DrawBox(title string, lines []string) {
 		fmt.Println(Style.TeeRight)
 	}
 
-	// Контент
 	for _, line := range lines {
 		lLen := visibleLen(line)
 		rightPadding := contentWidth - lLen
@@ -107,7 +149,6 @@ func (c *ConsoleAdapter) DrawBox(title string, lines []string) {
 		fmt.Println(" " + Style.Vertical)
 	}
 
-	// Нижняя рамка
 	fmt.Print(Style.BottomLeft)
 	fmt.Print(strings.Repeat(Style.Horizontal, contentWidth+2))
 	fmt.Println(Style.BottomRight)
@@ -130,9 +171,15 @@ func (c *ConsoleAdapter) PrintHelp() {
 		".addfriend <n> <p> <k> - добавить контакт",
 		".removefriend <nick>   - удалить контакт",
 		".connect <nick>        - начать чат",
-		".disconnect [nick]     - отменить/разорвать соединение",
-		".accept / .decline     - ответ на запрос",
+		".disconnect [nick]     - разорвать соединение",
+		".accept / .decline     - ответ на запрос чата",
 		".leave                 - выйти из чата",
+		"",
+		"--- Файлы ---",
+		".file <путь>           - предложить файл",
+		".getfile               - принять файл",
+		".nofile                - отклонить/отменить файл",
+		"",
 		".list                  - контакты",
 		".check                 - обновить статусы",
 		".find <nick>           - найти в DHT",
@@ -156,4 +203,22 @@ func SanitizeInput(input string, maxLen int) string {
 		return string(safeRunes[:maxLen])
 	}
 	return string(safeRunes)
+}
+
+func formatSize(bytes int64) string {
+	const (
+		KB = 1024
+		MB = 1024 * KB
+		GB = 1024 * MB
+	)
+	switch {
+	case bytes >= GB:
+		return fmt.Sprintf("%.2f GB", float64(bytes)/GB)
+	case bytes >= MB:
+		return fmt.Sprintf("%.2f MB", float64(bytes)/MB)
+	case bytes >= KB:
+		return fmt.Sprintf("%.2f KB", float64(bytes)/KB)
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
 }

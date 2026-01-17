@@ -4,17 +4,19 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/TheSiriuss/F2F-chat/pkg/f2f"
 	"github.com/chzyer/readline"
 	"golang.org/x/term"
-	"os"
 )
 
 func main() {
 	initStyle()
+	enableANSI() // Для Windows
 
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          "> ",
@@ -31,7 +33,6 @@ func main() {
 	fmt.Print("\033[H\033[2J")
 	ui.PrintBanner()
 
-	// === НОВОЕ: Ввод пароля ===
 	password, err := getPassword(ui)
 	if err != nil {
 		fmt.Println("Ошибка:", err)
@@ -74,8 +75,9 @@ func main() {
 			if active.String() != "" {
 				cleanMsg := SanitizeInput(line, f2f.MaxMsgLength)
 				if cleanMsg != "" {
+					// Очищаем строку ввода (курсор вверх + очистка строки)
+					clearInputLine()
 					node.SendChatMessage(active, cleanMsg)
-					fmt.Printf("[Вы %s]: %s\n", time.Now().Format("15:04"), cleanMsg)
 				}
 			} else {
 				if strings.TrimSpace(line) != "" {
@@ -121,9 +123,9 @@ func main() {
 				ui.OnLog(f2f.LogLevelInfo, "Пока работает только для своего ключа (без аргументов)")
 			} else {
 				idStr := node.GetIdentityString()
-				parts := strings.Fields(idStr)
-				if len(parts) >= 4 {
-					pubKeyBytes, _ := base64.StdEncoding.DecodeString(parts[3])
+				idParts := strings.Fields(idStr)
+				if len(idParts) >= 4 {
+					pubKeyBytes, _ := base64.StdEncoding.DecodeString(idParts[3])
 					fp := f2f.ComputeFingerprint(pubKeyBytes)
 					ui.DrawBox("ВАШ FINGERPRINT", []string{fp})
 				} else {
@@ -173,6 +175,41 @@ func main() {
 
 		case ".leave":
 			node.LeaveChat()
+
+		case ".file":
+			if len(parts) > 1 {
+				active := node.GetActiveChat()
+				if active.String() == "" {
+					ui.OnLog(f2f.LogLevelWarning, "Вы не в чате. Сначала подключитесь к контакту")
+					break
+				}
+				filePath := strings.Join(parts[1:], " ")
+				if err := node.SendFile(active, filePath); err != nil {
+					ui.OnLog(f2f.LogLevelError, "Ошибка: %v", err)
+				}
+			} else {
+				ui.OnLog(f2f.LogLevelInfo, "Использование: .file <путь к файлу>")
+			}
+
+		case ".getfile":
+			active := node.GetActiveChat()
+			if active.String() == "" {
+				ui.OnLog(f2f.LogLevelWarning, "Вы не в чате")
+				break
+			}
+			if err := node.AcceptFile(""); err != nil {
+				ui.OnLog(f2f.LogLevelError, "Ошибка: %v", err)
+			}
+
+		case ".nofile":
+			active := node.GetActiveChat()
+			if active.String() == "" {
+				ui.OnLog(f2f.LogLevelWarning, "Вы не в чате")
+				break
+			}
+			if err := node.DeclineFile(""); err != nil {
+				ui.OnLog(f2f.LogLevelError, "Ошибка: %v", err)
+			}
 
 		case ".list":
 			contacts := node.GetContacts()
@@ -230,7 +267,21 @@ func main() {
 	node.Shutdown()
 }
 
-// getPassword запрашивает пароль у пользователя
+// clearInputLine очищает строку ввода (после нажатия Enter)
+func clearInputLine() {
+	// ANSI: курсор вверх на 1 строку + очистка всей строки
+	fmt.Print("\033[1A\033[2K")
+}
+
+// enableANSI включает ANSI escape коды на Windows
+func enableANSI() {
+	if runtime.GOOS == "windows" {
+		// Windows 10+ поддерживает ANSI, но нужно включить
+		// Это делается автоматически при использовании golang.org/x/term
+		// Если не работает - можно добавить через windows API
+	}
+}
+
 func getPassword(ui *ConsoleAdapter) (string, error) {
 	isNew := f2f.IsNewUser()
 
@@ -252,7 +303,6 @@ func getPassword(ui *ConsoleAdapter) (string, error) {
 	fmt.Println()
 
 	if isNew {
-		// Подтверждение пароля для нового пользователя
 		fmt.Print("Подтвердите пароль: ")
 		confirm, err := readPassword()
 		if err != nil {
@@ -272,7 +322,6 @@ func getPassword(ui *ConsoleAdapter) (string, error) {
 	return password, nil
 }
 
-// readPassword читает пароль без эха
 func readPassword() (string, error) {
 	password, err := term.ReadPassword(int(os.Stdin.Fd()))
 	if err != nil {
@@ -299,7 +348,7 @@ func printNodeInfo(ui *ConsoleAdapter, node *f2f.Node) {
 	}
 
 	rawString := node.GetIdentityString()
-	parts := strings.Fields(rawString)
+	idParts := strings.Fields(rawString)
 
 	var lines []string
 	lines = append(lines, fmt.Sprintf("Ник:    %s", node.GetNickname()))
@@ -307,8 +356,8 @@ func printNodeInfo(ui *ConsoleAdapter, node *f2f.Node) {
 	lines = append(lines, fmt.Sprintf("Пиров:  %d", peers))
 	lines = append(lines, fmt.Sprintf("PeerID: %s", node.GetHostID()))
 
-	if len(parts) >= 4 {
-		pubKey := parts[3]
+	if len(idParts) >= 4 {
+		pubKey := idParts[3]
 		bytes, _ := base64.StdEncoding.DecodeString(pubKey)
 		fp := f2f.ComputeFingerprint(bytes)
 		lines = append(lines, fmt.Sprintf("FP:     %s", fp))

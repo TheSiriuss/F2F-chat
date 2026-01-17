@@ -8,6 +8,7 @@ import (
 	"image/color"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"sync"
@@ -1113,4 +1114,19 @@ func paintColor(gtx layout.Context, c color.NRGBA) {
 func drawDivider(gtx layout.Context, c color.NRGBA) layout.Dimensions {
 	paint.FillShape(gtx.Ops, c, clip.Rect{Max: image.Pt(gtx.Constraints.Max.X, 1)}.Op())
 	return layout.Dimensions{Size: image.Pt(gtx.Constraints.Max.X, 1)}
+}
+
+func (g *GUI) OnFileReceived(peerID string, nick string, filename string, data []byte, timestamp time.Time) {
+	g.OnLog(f2f.LogLevelInfo, "Получен файл '%s' от %s (%d bytes)", filename, nick, len(data))
+
+	savePath := filename
+	if _, err := os.Stat(savePath); err == nil {
+		ext := filepath.Ext(filename)
+		base := strings.TrimSuffix(filename, ext)
+		savePath = fmt.Sprintf("%s_%s%s", base, timestamp.Format("150405"), ext)
+	}
+
+	if err := os.WriteFile(savePath, data, 0644); err != nil {
+		g.OnLog(f2f.LogLevelError, "Ошибка сохранения: %v", err)
+	}
 }

@@ -27,8 +27,8 @@ func (n *Node) readFrame(s network.Stream) ([]byte, error) {
 		return nil, err
 	}
 	length := binary.BigEndian.Uint32(header)
-	if length > MaxMessageSize {
-		return nil, fmt.Errorf("too large: %d", length)
+	if length > MaxFrameSize {
+		return nil, fmt.Errorf("frame too large: %d", length)
 	}
 	buf := make([]byte, length)
 	if _, err := io.ReadFull(s, buf); err != nil {
@@ -57,7 +57,6 @@ func (n *Node) InitConnect(nickname string) {
 	}
 	c.Connecting = true
 
-	// Создаём контекст с возможностью отмены
 	ctx, cancel := context.WithCancel(n.ctx)
 	c.connectCtx = ctx
 	c.connectCancel = cancel
@@ -73,7 +72,6 @@ func (n *Node) InitConnect(nickname string) {
 		n.listener.OnContactUpdate()
 	}()
 
-	// Проверяем отмену перед поиском
 	select {
 	case <-ctx.Done():
 		return
@@ -90,7 +88,6 @@ func (n *Node) InitConnect(nickname string) {
 			n.host.Peerstore().AddAddrs(c.PeerID, info.Addrs, peerstore.PermanentAddrTTL)
 		}
 
-		// Проверяем отмену после поиска
 		select {
 		case <-ctx.Done():
 			n.Log(LogLevelInfo, "Подключение отменено")
@@ -104,7 +101,6 @@ func (n *Node) InitConnect(nickname string) {
 
 	s, err := n.host.NewStream(streamCtx, c.PeerID, ProtocolID)
 	if err != nil {
-		// Проверяем - была ли это отмена
 		select {
 		case <-ctx.Done():
 			n.Log(LogLevelInfo, "Подключение отменено")
@@ -114,7 +110,6 @@ func (n *Node) InitConnect(nickname string) {
 		return
 	}
 
-	// Ещё раз проверяем отмену после создания стрима
 	select {
 	case <-ctx.Done():
 		s.Close()
@@ -300,7 +295,6 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 		c.LastMsgTime = msg.Timestamp
 		c.mu.Unlock()
 
-		// Обрабатываем Cancel и Bye как сигнал завершения
 		if msg.Type == MsgTypeBye || msg.Type == MsgTypeCancel {
 			if msg.Type == MsgTypeCancel {
 				n.Log(LogLevelInfo, "%s отменил запрос", c.Nickname)
@@ -334,7 +328,6 @@ func (n *Node) processMessage(c *Contact, msgType string, ts int64, body string)
 
 	case MsgTypeAccept:
 		c.mu.Lock()
-		// Проверяем что мы ещё ждём ответа
 		if c.State != StatePendingOutgoing {
 			c.mu.Unlock()
 			return
@@ -359,6 +352,25 @@ func (n *Node) processMessage(c *Contact, msgType string, ts int64, body string)
 		}
 		timestamp := time.Unix(0, ts)
 		n.listener.OnMessage(c.PeerID.String(), c.Nickname, body, timestamp)
+
+	// --- File transfer messages ---
+	case MsgTypeFileOffer:
+		n.processFileOffer(c, body)
+
+	case MsgTypeFileAccept:
+		n.processFileAccept(c, body)
+
+	case MsgTypeFileDecline:
+		n.processFileDecline(c, body)
+
+	case MsgTypeFileCancel:
+		n.processFileCancel(c, body)
+
+	case MsgTypeFileChunk:
+		n.processFileChunk(c, body)
+
+	case MsgTypeFileDone:
+		n.processFileDone(c, body)
 	}
 }
 
@@ -403,8 +415,8 @@ func (n *Node) closeStream(c *Contact) {
 	c.localEphPub = nil
 	c.remoteEphPub = nil
 	c.sessionEstab = false
+	c.PendingFile = nil // Очищаем pending файл при дисконнекте
 
-	// Отменяем контекст подключения если есть
 	if c.connectCancel != nil {
 		c.connectCancel()
 		c.connectCancel = nil

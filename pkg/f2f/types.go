@@ -49,10 +49,18 @@ const (
 	MsgTypeRequest   = "req"
 	MsgTypeAccept    = "acc"
 	MsgTypeDecline   = "dec"
-	MsgTypeCancel    = "can" // НОВОЕ: отмена исходящего запроса
+	MsgTypeCancel    = "can"
 	MsgTypeText      = "txt"
 	MsgTypePing      = "png"
 	MsgTypeBye       = "bye"
+
+	// File transfer messages
+	MsgTypeFileOffer   = "fo"
+	MsgTypeFileAccept  = "fa"
+	MsgTypeFileDecline = "fd"
+	MsgTypeFileCancel  = "fc"
+	MsgTypeFileChunk   = "fch"
+	MsgTypeFileDone    = "fdn"
 )
 
 // --- Protocol Messages ---
@@ -70,6 +78,45 @@ type HandshakePayload struct {
 	NaClPubKey   []byte `json:"key"`
 	EphemeralPub []byte `json:"eph"`
 	Signature    []byte `json:"sig"`
+}
+
+// --- File Transfer Types ---
+
+type FileOffer struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+}
+
+type FileResponse struct {
+	ID string `json:"id"`
+}
+
+type FileChunk struct {
+	ID    string `json:"id"`
+	Index int    `json:"i"`
+	Total int    `json:"t"`
+	Data  string `json:"d"` // base64
+}
+
+type FileDone struct {
+	ID   string `json:"id"`
+	Hash string `json:"h"` // sha256 hex
+}
+
+type FileTransfer struct {
+	ID          string
+	Name        string
+	Size        int64
+	FilePath    string // для исходящих - путь к файлу
+	Buffer      []byte // для входящих - накопленные данные
+	Received    int64  // байт получено
+	ChunksSent  int    // чанков отправлено (для исходящих)
+	ChunksRecv  int    // чанков получено (для входящих)
+	TotalChunks int    // всего чанков
+	CreatedAt   time.Time
+	IsOutgoing  bool // true = мы отправляем
+	Cancelled   bool // отменена ли передача
 }
 
 // --- Contact ---
@@ -104,6 +151,9 @@ type Contact struct {
 	remoteEphPub *[32]byte `json:"-"`
 	sessionKey   *[32]byte `json:"-"`
 	sessionEstab bool      `json:"-"`
+
+	// File transfer (один файл за раз)
+	PendingFile *FileTransfer `json:"-"`
 
 	mu      sync.Mutex `json:"-"`
 	writeMu sync.Mutex `json:"-"`
