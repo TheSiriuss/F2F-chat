@@ -283,11 +283,11 @@ F2F Chat поддерживает безопасную передачу файл
 │                                                             │
 │  Alice                                      Bob             │
 │    │                                         │              │
-│    │──── Handshake (ephPubA, sig, nonce) ──>│               │
-│    │          [Signed with Ed25519]         │               │
+│    │──── Handshake (ephPubA, sig, nonce) ──> │              │
+│    │          [Signed with Ed25519]          │              │
 │    │                                         │              │
-│    │<─── Handshake (ephPubB, sig, nonce) ───│               │
-│    │          [Signed with Ed25519]         │               │
+│    │<─── Handshake (ephPubB, sig, nonce) ─── │              │
+│    │          [Signed with Ed25519]          │              │
 │    │                                         │              │
 │    │  X25519(ephPrivA, ephPubB) ──┐          │              │
 │    │                              ├─> HKDF ──> SharedSecret │
