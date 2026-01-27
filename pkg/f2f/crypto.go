@@ -36,51 +36,37 @@ func generateEphemeralKeys() (*[32]byte, *[32]byte, error) {
 
 // InitializeRatchet создает начальное состояние Ratchet из общего секрета Handshake.
 // isAlice = true для инициатора (Alice), false для ответчика (Bob).
-func InitializeRatchet(sharedSecret *[32]byte, bobPub *[32]byte) (*RatchetState, error) {
+func InitializeRatchet(sharedSecret, remotePub, localPriv, localPub *[32]byte, isInitiator bool) (*RatchetState, error) {
 	rs := &RatchetState{
 		SkippedMsgKeys: make(map[[36]byte]SkippedKey),
 	}
 
-	// Инициализация Root Chain из shared secret
-	// В Signal обычно делается сложнее (3-way handshake), но мы адаптируем существующий 2-way.
-	// Используем sharedSecret как начальный RootKey.
 	rs.RootKey = *sharedSecret
 
-	if bobPub != nil {
+	if isInitiator {
 		// ALICE (Initiator)
-		// У нас уже есть ключ Bob'a (из Handshake), и у нас есть наш Initial Key.
-		// Генерируем новый Ratchet Key pair сразу.
+		// Генерируем новую пару ключей для Ratchet
 		priv, pub, err := generateEphemeralKeys()
 		if err != nil {
 			return nil, err
 		}
 		rs.DHLocalPriv = priv
 		rs.DHLocalPub = pub
-		rs.DHRemotePub = bobPub
+		rs.DHRemotePub = remotePub // Bob's handshake public key
 
-		// Alice делает первый DH шаг сразу, так как она знает ключ Боба
+		// Alice делает первый DH step сразу
 		shared := computeDH(rs.DHLocalPriv, rs.DHRemotePub)
 		newRK, newCKs := kdfRK(&rs.RootKey, &shared)
 		rs.RootKey = newRK
 		rs.ChainKeyS = newCKs
-		// ChainKeyR останется пустым, пока Боб не ответит
+		// ChainKeyR будет установлен когда Bob ответит
 	} else {
 		// BOB (Responder)
-		// У нас пока нет Ratchet ключа, мы просто знаем RootKey (SharedSecret).
-		// Мы сохраним Handshake ключи как "Local", но для первого шага используем логику приема.
-		// В текущей реализации (f2f handshake) Боб сгенерировал EphemeralPub в handshake.
-		// Это и будет его "текущий" Ratchet Key.
-		// Примечание: Это упрощение. В идеале нужен новый обмен.
-		// Но мы просто инициализируем пару пустыми значениями и будем ждать первого заголовка от Алисы.
-
-		// Боб сгенерирует ключи при первом Ratchet step
-		priv, pub, err := generateEphemeralKeys()
-		if err != nil {
-			return nil, err
-		}
-		rs.DHLocalPriv = priv
-		rs.DHLocalPub = pub
-		// RemotePub пока неизвестен (в контексте Ratchet), он придет в заголовке
+		// ВАЖНО: Используем handshake ключи как начальные DH ключи!
+		// Это позволит Alice правильно установить shared secret
+		rs.DHLocalPriv = localPriv
+		rs.DHLocalPub = localPub
+		// DHRemotePub пока nil - будет установлен при получении первого сообщения
 	}
 
 	return rs, nil
@@ -125,11 +111,11 @@ func (n *Node) RatchetDecrypt(rs *RatchetState, headerBytes, ciphertext []byte) 
 		return plaintext, nil
 	}
 
-	// 2. Если пришел новый DH ключ (Ratchet Step)
-	if header.PublicKey != *rs.DHRemotePub {
-		// Проверяем, не слишком ли далеко ушел шаг (Anti-DoS)
-		// Для упрощения пропускаем строгую проверку лимита шагов, но в продакшене нужна.
+	// 2. Проверяем нужен ли DH Ratchet step
+	// ВАЖНО: rs.DHRemotePub может быть nil для Bob при первом сообщении
+	needRatchet := rs.DHRemotePub == nil || header.PublicKey != *rs.DHRemotePub
 
+	if needRatchet {
 		// Сохраняем пропущенные ключи из *текущей* приемной цепочки
 		if err := n.skipMessageKeys(rs, header.PN); err != nil {
 			return nil, fmt.Errorf("skip keys error: %v", err)
@@ -184,6 +170,11 @@ func (n *Node) skipMessageKeys(rs *RatchetState, until uint32) error {
 	// Если ChainKeyR не инициализирован (первый шаг), пропускать нечего
 	var empty [32]byte
 	if rs.ChainKeyR == empty {
+		return nil
+	}
+
+	// Если DHRemotePub nil (Bob до первого сообщения), пропускать нечего
+	if rs.DHRemotePub == nil {
 		return nil
 	}
 

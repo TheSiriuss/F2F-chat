@@ -75,10 +75,14 @@ func (n *Node) InitConnect(nickname string) {
 
 	c.mu.Lock()
 	if c.Stream != nil {
+		state := c.State
 		pid := c.PeerID
 		c.mu.Unlock()
 		n.Log(LogLevelWarning, "Уже подключены к %s", nickname)
-		n.EnterChat(pid)
+		// Входим в чат только если он уже активен
+		if state == StateActive {
+			n.EnterChat(pid)
+		}
 		return
 	}
 	if c.Connecting {
@@ -269,14 +273,18 @@ func (n *Node) readLoop(c *Contact, isInitiator bool) {
 		return
 	}
 
-	var bobPub *[32]byte
+	// ВАЖНО: Сохраняем handshake ключи ДО инициализации Ratchet
+	handshakePriv := c.handshakePriv
+	handshakePub := c.handshakePub
+
+	// Для initiator передаем remote pub, для responder - nil
+	var remotePubForRatchet *[32]byte
 	if isInitiator {
-		bobPub = remoteEphPub
-	} else {
-		bobPub = nil
+		remotePubForRatchet = remoteEphPub
 	}
 
-	ratchet, err := InitializeRatchet(initShared, bobPub)
+	// Инициализируем Ratchet с правильными параметрами
+	ratchet, err := InitializeRatchet(initShared, remotePubForRatchet, handshakePriv, handshakePub, isInitiator)
 	if err != nil {
 		c.mu.Unlock()
 		return
