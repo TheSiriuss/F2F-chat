@@ -1,0 +1,146 @@
+# --- Project Specific (Самое важное) ---
+# Файл с приватными ключами (IdentityFile).
+# Если это попадет в репозиторий — меняй личность.
+identity.json
+identity.dat
+
+# База контактов (ContactsFile).
+# Это личные данные пользователя.
+contacts.json
+contacts.dat
+
+# Полученные файлы (сохраняются в текущей директории)
+# Исключаем всё кроме примеров
+*.pdf
+*.doc
+*.docx
+*.zip
+*.tar.gz
+*.rar
+*.7z
+# Но разрешаем примеры в docs/
+!docs/**/*.pdf
+
+# Директории с загрузками/отправками
+downloads/
+uploads/
+received/
+sent/
+
+# --- Go Standard ---
+# Скомпилированные бинарники
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Бинарники проекта
+main
+f2f-chat
+f2f-cli
+f2f-gui
+f2f-chat-alpha
+/f2f-*
+!/f2f-chat/  # Разрешаем саму директорию проекта
+
+# Go workspace (Go 1.18+)
+go.work
+go.work.sum
+
+# Папка для зависимостей
+vendor/
+
+# Build/Debug
+debug
+*.log
+*.pprof
+coverage.out
+coverage.html
+
+# --- IDE & System ---
+# VS Code
+.vscode/
+!.vscode/settings.json.example
+!.vscode/launch.json.example
+
+# JetBrains (GoLand)
+.idea/
+*.iml
+*.iws
+
+# Vim
+*.swp
+*.swo
+*~
+.*.sw?
+
+# Emacs
+\#*\#
+.\#*
+
+# Mac
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.Trash-*
+
+# --- Environment ---
+.env
+.env.local
+.env.*.local
+*.env
+
+# --- Temp/Test ---
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+testdata/output/
+test_files/
+
+# --- Security & Debug ---
+# Core dumps
+core
+core.*
+
+# Flamegraphs и профили
+*.svg
+!docs/**/*.svg  # Разрешаем SVG в документации
+*.folded
+*.stacks
+
+# Ключи и сертификаты (на всякий случай)
+*.key
+*.pem
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+!test/**/*.key  # Разрешаем тестовые ключи
+
+# --- Network & DHT ---
+# Временные файлы DHT
+dht_cache/
+.ipfs/
+peer_store/
+
+# --- Documentation Build ---
+# Если используешь генераторы документации
+docs/_build/
+docs/.doctrees/
+site/
