@@ -144,3 +144,10 @@ peer_store/
 docs/_build/
 docs/.doctrees/
 site/
+# ASKI CHAT runtime artifacts
+aski-cli
+aski-cli.exe
+password.hint
+settings.json
+voice-*.wav
+voicemail-*.wav

@@ -3,6 +3,7 @@ package f2f
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -10,6 +11,7 @@ import (
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
+	qrcode "github.com/skip2/go-qrcode"
 )
 
 func (n *Node) Login(nickname string) {
@@ -374,4 +376,37 @@ func (n *Node) IsLoggedIn() bool {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.nickname != ""
+}
+
+// GetSASCode returns the short authentication string for the active session
+// with the given nickname. Empty string if no active session.
+// Users should compare this code out-of-band (voice/video) to verify the
+// session is not MITM'd. The code is session-scoped — new on every reconnect.
+func (n *Node) GetSASCode(nick string) string {
+	c := n.getContactByNick(nick)
+	if c == nil {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.sessionEstab {
+		return ""
+	}
+	return c.SASCode
+}
+
+// GenerateInviteQR returns an ASCII-art QR code encoding this node's
+// .addfriend invite string, suitable for printing in a terminal.
+// Error if user is not logged in.
+func (n *Node) GenerateInviteQR() (string, error) {
+	invite := n.GetIdentityString()
+	if invite == "Не залогинен" {
+		return "", errors.New("not logged in")
+	}
+	q, err := qrcode.New(invite, qrcode.Low)
+	if err != nil {
+		return "", fmt.Errorf("qr encode: %w", err)
+	}
+	// Compact terminal rendering using half-block characters.
+	return q.ToSmallString(false), nil
 }

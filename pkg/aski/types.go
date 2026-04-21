@@ -76,6 +76,23 @@ const (
 	MsgTypeFileDecline
 	MsgTypeFileCancel
 	MsgTypeFileDone
+
+	// Voice call control messages (go over the existing Ratchet chat stream)
+	MsgTypeCallOffer      // payload: sender's fresh X25519 ephemeral pubkey
+	MsgTypeCallAccept     // payload: responder's fresh X25519 ephemeral pubkey
+	MsgTypeCallDecline    // payload: none
+	MsgTypeCallEnd        // payload: none
+	MsgTypeCallRatchetPub // payload: new X25519 pub for DH ratchet step (PCS)
+)
+
+// CallState tracks voice-call state per contact.
+type CallState int
+
+const (
+	CallIdle CallState = iota
+	CallOutgoing
+	CallIncoming
+	CallActive
 )
 
 // --- Serialization Helpers ---
@@ -427,6 +444,12 @@ type Contact struct {
 	PublicKey   [32]byte
 	LastMsgTime int64
 
+	// KnownAddrs is a rolling list of up to MaxKnownAddrsPerContact multiaddrs
+	// that we've successfully reached this contact on in the past. Persisted
+	// across sessions so `.connect` doesn't need a fresh DHT round-trip every
+	// time. Most-recent-first order.
+	KnownAddrs []string
+
 	SeenNonces map[int64]time.Time
 
 	State           ChatState
@@ -449,11 +472,28 @@ type Contact struct {
 	Ratchet      *RatchetState
 	sessionEstab bool
 
+	// SASCode is the short authentication string for the current session,
+	// computed from both sides' handshake ephemerals. Users compare it
+	// out-of-band to verify no MITM. Cleared on disconnect. Not serialized.
+	SASCode string
+
 	// Ephemeral keys for initial handshake only
 	handshakePriv *[32]byte
 	handshakePub  *[32]byte
 
 	PendingFile *FileTransfer
+
+	// Voice call state (nil when no call in progress). See call.go.
+	Call *CallSession
+	// LastCallOfferAt throttles incoming CallOffers per contact. Prevents
+	// call-ringing spam if a compromised peer tries to flood us.
+	LastCallOfferAt time.Time
+
+	// LastConnectFailAt records when the last .connect attempt to this
+	// contact failed to establish the chat stream (typically NAT/relay).
+	// UIs use it to surface a "recently failed" hint so users aren't
+	// surprised that a "online" contact won't actually receive a message.
+	LastConnectFailAt time.Time
 
 	mu      sync.Mutex
 	writeMu sync.Mutex
@@ -465,7 +505,6 @@ type LocalIdentity struct {
 	Nickname   string
 	LibP2PPriv []byte
 	NaClPub    []byte
-	NaClPriv   []byte
 }
 
 func (id *LocalIdentity) Marshal() []byte {
@@ -473,7 +512,6 @@ func (id *LocalIdentity) Marshal() []byte {
 	b.WriteString(id.Nickname)
 	b.WriteBytes(id.LibP2PPriv)
 	b.WriteBytes(id.NaClPub)
-	b.WriteBytes(id.NaClPriv)
 	return b.Bytes()
 }
 
@@ -492,14 +530,16 @@ func (id *LocalIdentity) Unmarshal(data []byte) error {
 	if err != nil {
 		return err
 	}
-	id.NaClPriv, err = b.ReadBytes()
-	return err
+	// Legacy NaClPriv field (dropped): silently consume if present in old files.
+	_, _ = b.ReadBytes()
+	return nil
 }
 
 type SerializableContact struct {
-	Nickname  string
-	PeerID    string
-	PublicKey [32]byte
+	Nickname   string
+	PeerID     string
+	PublicKey  [32]byte
+	KnownAddrs []string // persisted cache of last-successful multiaddrs
 }
 
 func MarshalContacts(contacts []SerializableContact) []byte {
@@ -509,6 +549,10 @@ func MarshalContacts(contacts []SerializableContact) []byte {
 		b.WriteString(c.Nickname)
 		b.WriteString(c.PeerID)
 		b.WriteFixed32(c.PublicKey)
+		b.WriteUint32(uint32(len(c.KnownAddrs)))
+		for _, a := range c.KnownAddrs {
+			b.WriteString(a)
+		}
 	}
 	return b.Bytes()
 }
@@ -532,6 +576,22 @@ func UnmarshalContacts(data []byte) ([]SerializableContact, error) {
 		contacts[i].PublicKey, err = b.ReadFixed32()
 		if err != nil {
 			return nil, err
+		}
+		// KnownAddrs was added in a later version — treat EOF here as
+		// "old-format contact file, no cached addrs".
+		addrCount, err := b.ReadUint32()
+		if err != nil {
+			return contacts, nil
+		}
+		if addrCount > 0 {
+			contacts[i].KnownAddrs = make([]string, 0, addrCount)
+			for j := uint32(0); j < addrCount; j++ {
+				a, err := b.ReadString()
+				if err != nil {
+					break
+				}
+				contacts[i].KnownAddrs = append(contacts[i].KnownAddrs, a)
+			}
 		}
 	}
 	return contacts, nil

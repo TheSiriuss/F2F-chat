@@ -5,10 +5,12 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -55,7 +57,10 @@ func InitializeRatchet(sharedSecret, remotePub, localPriv, localPub *[32]byte, i
 		rs.DHRemotePub = remotePub // Bob's handshake public key
 
 		// Alice делает первый DH step сразу
-		shared := computeDH(rs.DHLocalPriv, rs.DHRemotePub)
+		shared, err := computeDH(rs.DHLocalPriv, rs.DHRemotePub)
+		if err != nil {
+			return nil, err
+		}
 		newRK, newCKs := kdfRK(&rs.RootKey, &shared)
 		rs.RootKey = newRK
 		rs.ChainKeyS = newCKs
@@ -167,6 +172,15 @@ func (n *Node) skipMessageKeys(rs *RatchetState, until uint32) error {
 		return errors.New("too many skipped messages")
 	}
 
+	// Purge expired skipped keys before storing new ones.
+	if cutoff := time.Now().Add(-MaxSkipKeyAge); len(rs.SkippedMsgKeys) > 0 {
+		for k, v := range rs.SkippedMsgKeys {
+			if v.Timestamp.Before(cutoff) {
+				delete(rs.SkippedMsgKeys, k)
+			}
+		}
+	}
+
 	// Если ChainKeyR не инициализирован (первый шаг), пропускать нечего
 	var empty [32]byte
 	if rs.ChainKeyR == empty {
@@ -202,7 +216,10 @@ func (n *Node) dhRatchetStep(rs *RatchetState, remotePub *[32]byte) error {
 	rs.DHRemotePub = remotePub
 
 	// Root KDF 1: R_k + DH(Local, Remote) -> New R_k, ChainKeyR
-	sharedReceive := computeDH(rs.DHLocalPriv, remotePub)
+	sharedReceive, err := computeDH(rs.DHLocalPriv, remotePub)
+	if err != nil {
+		return err
+	}
 	rs.RootKey, rs.ChainKeyR = kdfRK(&rs.RootKey, &sharedReceive)
 
 	// Генерируем новый ключ для отправки
@@ -214,7 +231,10 @@ func (n *Node) dhRatchetStep(rs *RatchetState, remotePub *[32]byte) error {
 	rs.DHLocalPub = pub
 
 	// Root KDF 2: R_k + DH(NewLocal, Remote) -> New R_k, ChainKeyS
-	sharedSend := computeDH(rs.DHLocalPriv, remotePub)
+	sharedSend, err := computeDH(rs.DHLocalPriv, remotePub)
+	if err != nil {
+		return err
+	}
 	rs.RootKey, rs.ChainKeyS = kdfRK(&rs.RootKey, &sharedSend)
 
 	return nil
@@ -222,11 +242,16 @@ func (n *Node) dhRatchetStep(rs *RatchetState, remotePub *[32]byte) error {
 
 // --- KDF Helpers ---
 
-// computeDH: X25519(priv, pub)
-func computeDH(priv, pub *[32]byte) [32]byte {
-	var shared [32]byte
-	curve25519.ScalarMult(&shared, priv, pub)
-	return shared
+// computeDH: X25519(priv, pub). Rejects low-order points (returns error
+// on all-zero output).
+func computeDH(priv, pub *[32]byte) ([32]byte, error) {
+	var out [32]byte
+	shared, err := curve25519.X25519(priv[:], pub[:])
+	if err != nil {
+		return out, fmt.Errorf("x25519: %w", err)
+	}
+	copy(out[:], shared)
+	return out, nil
 }
 
 // kdfRK: HKDF(root_key, dh_out) -> (root_key, chain_key)
@@ -245,37 +270,18 @@ func kdfRK(rootKey, dhOut *[32]byte) ([32]byte, [32]byte) {
 	return newRoot, newChain
 }
 
-// kdfCK: HMAC(chain_key) -> (chain_key, msg_key)
+// kdfCK: HMAC(chain_key) -> (next_chain_key, msg_key).
+// Canonical Signal spec: MsgKey = HMAC(CK, 0x01), NextCK = HMAC(CK, 0x02).
 func kdfCK(chainKey *[32]byte) ([32]byte, [32]byte) {
-	// HMAC-SHA256
-	// MsgKey = HMAC(ChainKey, "1")
-	// NextChainKey = HMAC(ChainKey, "2")
+	var nextChain, msgKey [32]byte
 
 	h := hmac.New(sha256.New, chainKey[:])
 	h.Write([]byte{0x01})
-	res1 := h.Sum(nil) // Используем часть как ключ
+	copy(msgKey[:], h.Sum(nil))
 
 	h.Reset()
 	h.Write([]byte{0x02})
-	res2 := h.Sum(nil)
-
-	// KDF обычно требует 32 байта для ключа
-	// Используем HKDF expander или просто SHA256 output,
-	// но HMAC-SHA256 уже дает 32 байта, что подходит.
-
-	// Чтобы строго соответствовать Signal spec, там используются константы 0x01, 0x02
-	// и HMAC как KDF.
-	// Мы дополнительно прогоним через HKDF-Expand для чистоты изоляции (InfoMsgKey).
-
-	// Message Key Derivation
-	mkReader := hkdf.Expand(sha256.New, res1, InfoMsgKey)
-	var msgKey [32]byte
-	io.ReadFull(mkReader, msgKey[:])
-
-	// Chain Key Derivation
-	ckReader := hkdf.Expand(sha256.New, res2, InfoChainKey)
-	var nextChain [32]byte
-	io.ReadFull(ckReader, nextChain[:])
+	copy(nextChain[:], h.Sum(nil))
 
 	return nextChain, msgKey
 }
@@ -312,6 +318,23 @@ func (n *Node) decryptXChaChaAD(ciphertext []byte, key *[32]byte, ad []byte) ([]
 
 // --- Legacy & Helpers ---
 
+// handshakeSigContext is prepended to the signed payload so that a signature
+// produced under this libp2p identity key for some other protocol cannot be
+// replayed here (cross-protocol replay protection via domain separation).
+const handshakeSigContext = "F2F-Handshake-v1:"
+
+// handshakeSigBytes builds the byte-string that gets signed/verified.
+func handshakeSigBytes(version string, ts, nonce int64, naclPub, ephPub []byte) []byte {
+	buf := new(bytes.Buffer)
+	buf.WriteString(handshakeSigContext)
+	buf.WriteString(version)
+	binary.Write(buf, binary.BigEndian, ts)
+	binary.Write(buf, binary.BigEndian, nonce)
+	buf.Write(naclPub)
+	buf.Write(ephPub)
+	return buf.Bytes()
+}
+
 // createHandshakeBytes creates signed handshake payload
 func (n *Node) createHandshakeBytes(ephPub *[32]byte) ([]byte, error) {
 	privKey := n.host.Peerstore().PrivKey(n.host.ID())
@@ -329,14 +352,7 @@ func (n *Node) createHandshakeBytes(ephPub *[32]byte) ([]byte, error) {
 		EphemeralPub: ephPub[:],
 	}
 
-	buf := new(bytes.Buffer)
-	buf.WriteString(payload.Version)
-	binary.Write(buf, binary.BigEndian, payload.Timestamp)
-	binary.Write(buf, binary.BigEndian, payload.Nonce)
-	buf.Write(payload.NaClPubKey)
-	buf.Write(payload.EphemeralPub)
-
-	sig, err := privKey.Sign(buf.Bytes())
+	sig, err := privKey.Sign(handshakeSigBytes(payload.Version, payload.Timestamp, payload.Nonce, payload.NaClPubKey, payload.EphemeralPub))
 	if err != nil {
 		return nil, err
 	}
@@ -355,23 +371,41 @@ func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 		return nil, fmt.Errorf("decode handshake: %w", err)
 	}
 
-	// Разрешаем старые версии, если нужно, но лучше строгий чек
 	if payload.Version != ProtocolVersion {
-		// Log warning?
+		return nil, fmt.Errorf("protocol version mismatch: got %q, want %q", payload.Version, ProtocolVersion)
 	}
 
 	if len(payload.EphemeralPub) != 32 {
 		return nil, errors.New("bad eph key")
 	}
 
-	// Check timestamp
+	// Check timestamp first (cheap)
 	now := time.Now()
 	ts := time.Unix(0, payload.Timestamp)
 	if now.Sub(ts) > MaxTimeSkew || ts.Sub(now) > MaxTimeSkew {
 		return nil, errors.New("time skew")
 	}
 
-	// Replay protection
+	// Verify signature BEFORE touching replay cache, so a forged handshake
+	// cannot pollute SeenNonces (even though the libp2p transport already
+	// authenticates the peer, keep the ordering defensively correct).
+	remotePub := n.host.Peerstore().PubKey(c.PeerID)
+	if remotePub == nil {
+		return nil, errors.New("no key")
+	}
+
+	sigBytes := handshakeSigBytes(payload.Version, payload.Timestamp, payload.Nonce, payload.NaClPubKey, payload.EphemeralPub)
+	ok, _ := remotePub.Verify(sigBytes, payload.Signature)
+	if !ok {
+		return nil, errors.New("bad sig")
+	}
+
+	// Constant-time compare of the long-term identity pubkey.
+	if len(payload.NaClPubKey) != 32 || subtle.ConstantTimeCompare(payload.NaClPubKey, c.PublicKey[:]) != 1 {
+		return nil, errors.New("key mismatch")
+	}
+
+	// Replay protection — only after cryptographic auth passes.
 	c.mu.Lock()
 	if c.SeenNonces == nil {
 		c.SeenNonces = make(map[int64]time.Time)
@@ -392,30 +426,6 @@ func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 	c.SeenNonces[payload.Nonce] = time.Now()
 	c.mu.Unlock()
 
-	// Verify signature
-	remotePub := n.host.Peerstore().PubKey(c.PeerID)
-	if remotePub == nil {
-		return nil, errors.New("no key")
-	}
-
-	buf := new(bytes.Buffer)
-	buf.WriteString(payload.Version)
-	binary.Write(buf, binary.BigEndian, payload.Timestamp)
-	binary.Write(buf, binary.BigEndian, payload.Nonce)
-	buf.Write(payload.NaClPubKey)
-	buf.Write(payload.EphemeralPub)
-
-	ok, _ := remotePub.Verify(buf.Bytes(), payload.Signature)
-	if !ok {
-		return nil, errors.New("bad sig")
-	}
-
-	var recKey [32]byte
-	copy(recKey[:], payload.NaClPubKey)
-	if recKey != c.PublicKey {
-		return nil, errors.New("key mismatch")
-	}
-
 	var ephPub [32]byte
 	copy(ephPub[:], payload.EphemeralPub)
 	return &ephPub, nil
@@ -423,8 +433,12 @@ func (n *Node) verifyHandshake(c *Contact, data []byte) (*[32]byte, error) {
 
 // deriveSessionKey используется ТОЛЬКО для начального handshake, чтобы получить RootKey
 func deriveSessionKey(localPriv, localPub, remotePub *[32]byte) (*[32]byte, error) {
+	sharedSlice, err := curve25519.X25519(localPriv[:], remotePub[:])
+	if err != nil {
+		return nil, fmt.Errorf("x25519: %w", err)
+	}
 	var shared [32]byte
-	curve25519.ScalarMult(&shared, localPriv, remotePub)
+	copy(shared[:], sharedSlice)
 
 	var saltBuf bytes.Buffer
 	saltBuf.WriteString("f2f-init-v1:")
@@ -449,8 +463,40 @@ func deriveSessionKey(localPriv, localPub, remotePub *[32]byte) (*[32]byte, erro
 	return &sessionKey, nil
 }
 
+// sasContext domain-separates SAS derivation so the code can't collide with
+// any other hash produced in this protocol.
+const sasContext = "F2F-SAS-v1:"
+
+// ComputeSAS returns a short session authentication string derived from both
+// parties' handshake ephemeral public keys. Both sides MUST produce identical
+// output when given the same pair of keys. Verified out-of-band (voice/video)
+// to rule out MITM: attacker would have to run two handshakes whose SAS collide,
+// which for 64-bit SAS means ~2^32 parallel sessions (birthday bound).
+//
+// Format: 4 dash-separated groups of 4 hex chars → "AB12-CD34-EF56-7890".
+func ComputeSAS(pub1, pub2 []byte) string {
+	low, high := pub1, pub2
+	if bytes.Compare(pub1, pub2) > 0 {
+		low, high = pub2, pub1
+	}
+	h := sha256.New()
+	h.Write([]byte(sasContext))
+	h.Write(low)
+	h.Write(high)
+	sum := h.Sum(nil)
+	hex := fmt.Sprintf("%X", sum[:8]) // 64 bits
+	return fmt.Sprintf("%s-%s-%s-%s", hex[0:4], hex[4:8], hex[8:12], hex[12:16])
+}
+
+// ComputeFingerprint returns a 160-bit hex fingerprint of the given public key,
+// formatted as 10 dash-separated groups of 4 hex characters.
+// 160 bits gives ~2^80 preimage resistance — acceptable for manual OOB verification.
 func ComputeFingerprint(pubKey []byte) string {
 	hash := sha256.Sum256(pubKey)
-	hex := fmt.Sprintf("%X", hash[:8])
-	return fmt.Sprintf("%s-%s-%s-%s", hex[0:4], hex[4:8], hex[8:12], hex[12:16])
+	h := fmt.Sprintf("%X", hash[:20]) // 20 bytes = 160 bits = 40 hex chars
+	groups := make([]string, 10)
+	for i := 0; i < 10; i++ {
+		groups[i] = h[i*4 : (i+1)*4]
+	}
+	return strings.Join(groups, "-")
 }

@@ -14,6 +14,18 @@ type UIListener interface {
 	OnChatChanged(peerID string, nick string)
 }
 
+// CallListener is an optional interface a UIListener may implement to get
+// per-peer call lifecycle events. Falls back to OnLog-only if absent, so
+// breaking existing implementations is opt-in.
+//
+// `kind` is "voice" or "video" — UI uses it to distinguish the prompt.
+type CallListener interface {
+	OnCallIncoming(peerID, nick, kind string)
+	OnCallOutgoing(peerID, nick, kind string)
+	OnCallActive(peerID, nick, kind string)
+	OnCallEnded(peerID, nick, reason, duration string)
+}
+
 const (
 	LogLevelInfo    = "INFO"
 	LogLevelWarning = "WARN"

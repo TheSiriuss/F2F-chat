@@ -113,10 +113,19 @@ func (n *Node) checkSinglePresence(pid peer.ID) {
 		return
 	}
 
-	if n.host.Network().Connectedness(pid) == network.Connected {
+	// Prefer live signals over DHT: an open chat stream or an active
+	// libp2p connection means we're IN CONTACT with this peer right now.
+	// Only fall back to DHT when neither holds.
+	c.mu.Lock()
+	hasStream := c.Stream != nil
+	c.mu.Unlock()
+
+	if conn := n.host.Network().Connectedness(pid); hasStream || conn == network.Connected || conn == network.Limited {
+		addrs := n.host.Peerstore().Addrs(pid)
 		c.mu.Lock()
 		c.Presence = PresenceOnline
 		c.LastSeen = time.Now()
+		c.AddressCount = len(addrs)
 		c.FailCount = 0
 		c.NextCheckTime = time.Now().Add(PresenceInterval)
 		c.mu.Unlock()
@@ -130,10 +139,19 @@ func (n *Node) checkSinglePresence(pid peer.ID) {
 
 	c.mu.Lock()
 	c.LastChecked = time.Now()
-	if err != nil {
+	// Treat "FindPeer returned a record with zero addresses" the same as a
+	// DHT error — we can't actually reach the peer, so calling them
+	// "online" is a lie that causes .connect to fail immediately after.
+	if err != nil || len(info.Addrs) == 0 {
 		c.Presence = PresenceOffline
+		c.AddressCount = 0
 		c.FailCount++
-		backoff := time.Duration(30*(1<<c.FailCount)) * time.Second
+		// Cap shift amount to avoid int overflow on long-running offline peers.
+		shift := c.FailCount
+		if shift > 8 {
+			shift = 8
+		}
+		backoff := time.Duration(30*(1<<shift)) * time.Second
 		if backoff > MaxPresenceBackoff {
 			backoff = MaxPresenceBackoff
 		}
@@ -144,9 +162,7 @@ func (n *Node) checkSinglePresence(pid peer.ID) {
 		c.AddressCount = len(info.Addrs)
 		c.FailCount = 0
 		c.NextCheckTime = time.Now().Add(PresenceInterval)
-		if len(info.Addrs) > 0 {
-			n.host.Peerstore().AddAddrs(pid, info.Addrs, peerstore.TempAddrTTL)
-		}
+		n.host.Peerstore().AddAddrs(pid, info.Addrs, peerstore.TempAddrTTL)
 	}
 	c.mu.Unlock()
 
@@ -162,7 +178,28 @@ func (n *Node) FindContact(nick string) {
 
 	c.mu.Lock()
 	pid := c.PeerID
+	hasStream := c.Stream != nil
 	c.mu.Unlock()
+
+	// Short-circuit: if we ALREADY have a live libp2p connection to the
+	// peer (or an open chat stream), we're definitively in contact with
+	// them — going to DHT is wasted work and, worse, returns a stale
+	// "offline" verdict when the DHT record is out-of-date. The live
+	// connection is the source of truth.
+	if conn := n.host.Network().Connectedness(pid); hasStream || conn == network.Connected || conn == network.Limited {
+		addrs := n.host.Peerstore().Addrs(pid)
+		c.mu.Lock()
+		c.Presence = PresenceOnline
+		c.LastSeen = time.Now()
+		c.AddressCount = len(addrs)
+		c.FailCount = 0
+		c.LastChecked = time.Now()
+		c.mu.Unlock()
+		n.Log(LogLevelSuccess, "%s — уже в сети (живое соединение, %d адресов в peerstore)",
+			nick, len(addrs))
+		n.listener.OnContactUpdate()
+		return
+	}
 
 	n.Log(LogLevelInfo, "Поиск %s в DHT...", nick)
 
@@ -175,11 +212,18 @@ func (n *Node) FindContact(nick string) {
 
 	c.mu.Lock()
 	c.LastChecked = time.Now()
-	if err != nil {
+	switch {
+	case err != nil:
 		c.Presence = PresenceOffline
+		c.AddressCount = 0
 		c.mu.Unlock()
-		n.Log(LogLevelError, "%s не найден (%.1fs)", nick, elapsed.Seconds())
-	} else {
+		n.Log(LogLevelError, "%s не найден (%.1fs): %v", nick, elapsed.Seconds(), err)
+	case len(info.Addrs) == 0:
+		c.Presence = PresenceOffline
+		c.AddressCount = 0
+		c.mu.Unlock()
+		n.Log(LogLevelWarning, "%s — peerID в DHT есть, но адресов 0 (запись устарела / контакт не в сети)", nick)
+	default:
 		c.Presence = PresenceOnline
 		c.LastSeen = time.Now()
 		c.AddressCount = len(info.Addrs)

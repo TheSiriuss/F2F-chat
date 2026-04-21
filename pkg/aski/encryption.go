@@ -12,10 +12,13 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// Параметры Argon2id
+// Параметры Argon2id (ужесточены на 2026: 256 MB, t=4).
+// ВНИМАНИЕ: смена параметров ломает существующие identity.dat/contacts.dat —
+// соль хранится в файле, но параметры нет, поэтому deriveKey всегда использует
+// текущие константы. Старые зашифрованные файлы придётся пересоздать.
 const (
-	argonTime    = 3
-	argonMemory  = 64 * 1024 // 64 MB
+	argonTime    = 4
+	argonMemory  = 256 * 1024 // 256 MB
 	argonThreads = 4
 	argonKeyLen  = 32
 	saltLen      = 16
@@ -193,6 +196,71 @@ func ValidatePassword(password string) error {
 
 func IsNewUser() bool {
 	return !IdentityExists()
+}
+
+// PasswordAdvice returns a human-readable warning string if the password
+// could be significantly stronger, or an empty string if it looks OK.
+// This is purely advisory — the function never rejects a password.
+func PasswordAdvice(pw string) string {
+	runes := []rune(pw)
+	if len(runes) == 0 {
+		return "пароль пустой"
+	}
+	if len(runes) < MinRecommendedPasswordLen {
+		return fmt.Sprintf("пароль короче %d символов — легко подбирается offline. Рекомендуется passphrase из 4+ несвязанных слов или 16+ случайных символов.", MinRecommendedPasswordLen)
+	}
+
+	var hasLower, hasUpper, hasDigit, hasSymbol bool
+	for _, r := range runes {
+		switch {
+		case r >= 'a' && r <= 'z':
+			hasLower = true
+		case r >= 'A' && r <= 'Z':
+			hasUpper = true
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		default:
+			hasSymbol = true
+		}
+	}
+	classes := 0
+	for _, b := range []bool{hasLower, hasUpper, hasDigit, hasSymbol} {
+		if b {
+			classes++
+		}
+	}
+	// Long passphrases get a pass on class diversity.
+	if len(runes) >= 20 {
+		return ""
+	}
+	if classes < 3 {
+		return "пароль из одного класса символов (только буквы / только цифры) — рекомендуется смешивать регистр, цифры и знаки."
+	}
+	return ""
+}
+
+// SavePasswordHint writes a plaintext hint next to identity.dat. Empty hint
+// removes any existing file.
+func SavePasswordHint(hint string) error {
+	runes := []rune(hint)
+	if len(runes) > MaxHintLength {
+		runes = runes[:MaxHintLength]
+	}
+	hint = string(runes)
+	if hint == "" {
+		_ = os.Remove(HintFile)
+		return nil
+	}
+	return writeAtomic(HintFile, []byte(hint))
+}
+
+// LoadPasswordHint returns the saved hint, or empty string if none.
+func LoadPasswordHint() string {
+	data, err := os.ReadFile(HintFile)
+	if err != nil {
+		return ""
+	}
+	return string(data)
 }
 
 func ChangePassword(oldPassword, newPassword string) error {

@@ -3,6 +3,7 @@ package f2f
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -311,23 +312,11 @@ func (n *Node) processBinaryChunk(c *Contact, plaintext []byte) {
 		return
 	}
 
-	// Читаем заголовок прямо из plaintext
 	// [FileID 16] [Index 4] [Total 4] [Data...]
 	var fileID [16]byte
 	copy(fileID[:], plaintext[0:16])
-	// Используем encoding/binary из пакета binary (нужно проверить импорты, но в этом файле он не импортирован)
-	// Добавим ручное чтение BigEndian, так как binary не импортирован в оригинале,
-	// но лучше добавить import "encoding/binary" в начало файла.
-	// (Я добавил "encoding/binary" в импорты types.go, но не здесь. Здесь нет import "encoding/binary")
-	// Предполагаем, что нужно добавить импорт. Для надежности реализуем тут.
-
-	// Helper for uint32
-	beUint32 := func(b []byte) uint32 {
-		return uint32(b[3]) | uint32(b[2])<<8 | uint32(b[1])<<16 | uint32(b[0])<<24
-	}
-
-	index := beUint32(plaintext[16:20])
-	total := beUint32(plaintext[20:24])
+	index := binary.BigEndian.Uint32(plaintext[16:20])
+	total := binary.BigEndian.Uint32(plaintext[20:24])
 	data := plaintext[24:]
 
 	c.mu.Lock()
@@ -403,7 +392,7 @@ func (n *Node) processFileOffer(c *Contact, payload []byte) {
 
 	nick := c.Nickname
 	pid := c.PeerID
-	safeName := filepath.Base(offer.Name)
+	safeName := SanitizeFilename(filepath.Base(offer.Name))
 
 	c.PendingFile = &FileTransfer{
 		ID:         offer.ID,
@@ -523,11 +512,19 @@ func (n *Node) processFileDone(c *Contact, payload []byte) {
 		return
 	}
 
-	savePath := fileName
-	if _, err := os.Stat(savePath); err == nil {
-		ext := filepath.Ext(fileName)
-		base := fileName[:len(fileName)-len(ext)]
-		savePath = fmt.Sprintf("%s_%s%s", base, time.Now().Format("150405"), ext)
+	// Voice messages get renamed into the receiver's own voicemail-N sequence
+	// so numbering is local-independent (sender voicemail-5 might land as
+	// voicemail-1 for a fresh recipient).
+	var savePath string
+	if IsVoiceMessage(fileName) {
+		savePath = NextVoicemailName(".")
+	} else {
+		savePath = fileName
+		if _, err := os.Stat(savePath); err == nil {
+			ext := filepath.Ext(fileName)
+			base := fileName[:len(fileName)-len(ext)]
+			savePath = fmt.Sprintf("%s_%s%s", base, time.Now().Format("150405"), ext)
+		}
 	}
 
 	if err := os.Rename(tempPath, savePath); err != nil {

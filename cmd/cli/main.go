@@ -1,15 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"fmt"
 	"os"
 	"runtime"
 	"strings"
-	"time"
+	"unicode"
 
-	"github.com/TheSiriuss/F2F-chat/pkg/f2f"
+	"github.com/TheSiriuss/aski/cmd/cli/tui"
+	"github.com/TheSiriuss/aski/pkg/aski"
 	"github.com/chzyer/readline"
 	"golang.org/x/term"
 )
@@ -28,19 +30,30 @@ func main() {
 	}
 	defer func() { _ = rl.Close() }()
 
-	ui := &ConsoleAdapter{rl: rl}
+	// Turn on ANSI/VT processing for stdout on Windows so our cursor
+	// manipulation escapes (\x1b[F, \x1b[2K etc.) actually take effect.
+	enableVTMode()
+
+	bootstrapUI := &ConsoleAdapter{rl: rl}
 
 	fmt.Print("\033[H\033[2J")
-	ui.PrintBanner()
+	bootstrapUI.PrintBanner()
 
-	password, err := getPassword(ui)
+	password, err := getPassword(bootstrapUI)
 	if err != nil {
 		fmt.Println("Ошибка:", err)
 		return
 	}
 
+	// TUI adapter — receives all f2f events and forwards them to bubbletea.
+	// Events that fire before tui.Run() attaches a program are dropped, so
+	// we show a "starting..." line and kick things off quickly.
+	fmt.Println("\nЗагрузка F2F...")
+
+	tuiAdapter := tui.NewAdapter()
+
 	ctx := context.Background()
-	node, err := f2f.NewNode(ctx, ui, password)
+	node, err := f2f.NewNode(ctx, tuiAdapter, password)
 	if err != nil {
 		if err == f2f.ErrWrongPassword {
 			fmt.Println("Неверный пароль!")
@@ -52,18 +65,20 @@ func main() {
 
 	if err := node.LoadContacts(); err != nil {
 		// Silent fail
+		_ = err
 	}
 
-	if node.GetNickname() != "" {
-		ui.OnLog(f2f.LogLevelSuccess, "Авто-вход: %s", node.GetNickname())
-		go func() {
-			time.Sleep(200 * time.Millisecond)
-			printNodeInfo(ui, node)
-		}()
-	} else {
-		ui.OnLog(f2f.LogLevelInfo, "Введите .login <ник> для создания профиля")
+	// Hand control to bubbletea. Blocks until Ctrl+C / /quit.
+	if err := tui.Run(node, tuiAdapter); err != nil {
+		fmt.Println("TUI error:", err)
 	}
 
+	node.Shutdown()
+}
+
+// Legacy readline REPL — replaced by the bubbletea TUI in cmd/cli/tui.
+// Kept out of the build; reference only.
+func legacyREPL(rl *readline.Instance, node *f2f.Node, ui *ConsoleAdapter) {
 	for {
 		line, err := rl.Readline()
 		if err != nil {
@@ -75,7 +90,6 @@ func main() {
 			if active.String() != "" {
 				cleanMsg := SanitizeInput(line, f2f.MaxMsgLength)
 				if cleanMsg != "" {
-					clearInputLine()
 					node.SendChatMessage(active, cleanMsg)
 				}
 			} else {
@@ -116,6 +130,32 @@ func main() {
 
 		case ".info":
 			printNodeInfo(ui, node)
+
+		case ".qr":
+			qr, err := node.GenerateInviteQR()
+			if err != nil {
+				ui.OnLog(f2f.LogLevelError, "QR: %v", err)
+			} else {
+				ui.OnLog(f2f.LogLevelInfo, "QR-код приглашения (сканируйте или покажите другу):")
+				fmt.Println(qr)
+			}
+
+		case ".sas":
+			if len(parts) < 2 {
+				ui.OnLog(f2f.LogLevelInfo, "Использование: .sas <nick>")
+				break
+			}
+			code := node.GetSASCode(parts[1])
+			if code == "" {
+				ui.OnLog(f2f.LogLevelWarning, "Нет активной сессии с %s", parts[1])
+			} else {
+				ui.DrawBox("SAS ДЛЯ "+parts[1], []string{
+					code,
+					"",
+					"Прочитайте код собеседнику по голосовому каналу.",
+					"Если коды совпадают — MITM исключён.",
+				})
+			}
 
 		case ".fingerprint":
 			if len(parts) > 1 {
@@ -252,6 +292,141 @@ func main() {
 				go node.FindContact(parts[1])
 			}
 
+		case ".rec":
+			handleRecord(ui, node, rl, parts)
+
+		case ".play":
+			handlePlay(ui, parts)
+
+		case ".settings":
+			handleSettings(ui, rl)
+
+		case ".voicecall":
+			target := pickCallTarget(node, parts, false)
+			if target == "" {
+				ui.OnLog(f2f.LogLevelInfo, "Использование: .voicecall [<nick>] (или в активном чате)")
+			} else if err := node.InitiateCall(target); err != nil {
+				ui.OnLog(f2f.LogLevelError, "Звонок: %v", err)
+			}
+
+		case ".videocall":
+			target := pickCallTarget(node, parts, false)
+			if target == "" {
+				ui.OnLog(f2f.LogLevelInfo, "Использование: .videocall [<nick>] (или в активном чате)")
+				break
+			}
+			// Make sure ffmpeg is available if settings point at camera.
+			s := f2f.LoadSettings()
+			wantsCamera := s.VideoSourceType == "camera" ||
+				(s.VideoSourceType == "" && s.VideoCameraID != "")
+			if wantsCamera && !ensureFFmpegInstalled(ui) {
+				break
+			}
+			if err := node.InitiateCall(target); err != nil {
+				ui.OnLog(f2f.LogLevelError, "Звонок: %v", err)
+				break
+			}
+			// Watch for CallActive state, then start outgoing video.
+			go autoStartVideoOnAccept(node, ui, target)
+
+		case ".acceptcall":
+			target := pickCallTarget(node, parts, true)
+			if target == "" {
+				ui.OnLog(f2f.LogLevelInfo, "Нет входящих вызовов")
+			} else if err := node.AcceptCall(target); err != nil {
+				ui.OnLog(f2f.LogLevelError, "Приём: %v", err)
+			}
+
+		case ".declinecall":
+			target := pickCallTarget(node, parts, true)
+			if target == "" {
+				ui.OnLog(f2f.LogLevelInfo, "Нет входящих вызовов")
+			} else if err := node.DeclineCall(target); err != nil {
+				ui.OnLog(f2f.LogLevelError, "Отказ: %v", err)
+			}
+
+		case ".hangup":
+			target := pickCallTarget(node, parts, false)
+			if target == "" {
+				ui.OnLog(f2f.LogLevelInfo, "Нет активных вызовов")
+			} else if err := node.EndCall(target); err != nil {
+				ui.OnLog(f2f.LogLevelError, "Отбой: %v", err)
+			}
+
+		case ".video":
+			target := pickCallTarget(node, nil, false)
+			if target == "" {
+				ui.OnLog(f2f.LogLevelInfo, "Видео работает только во время активного .voicecall")
+				break
+			}
+			source := ""
+			if len(parts) > 1 {
+				source = strings.Join(parts[1:], " ")
+			}
+			// If user selected camera (explicitly or via settings default),
+			// ensure ffmpeg is installed before proceeding.
+			wantsCamera := strings.EqualFold(source, "camera") ||
+				strings.EqualFold(source, "cam") ||
+				strings.EqualFold(source, "webcam")
+			if !wantsCamera && source == "" {
+				s := f2f.LoadSettings()
+				wantsCamera = s.VideoSourceType == "camera" ||
+					(s.VideoSourceType == "" && s.VideoCameraID != "")
+			}
+			if wantsCamera && !ensureFFmpegInstalled(ui) {
+				break
+			}
+			if err := node.StartVideoFrom(target, source); err != nil {
+				ui.OnLog(f2f.LogLevelError, "Видео: %v", err)
+			}
+
+		case ".cameras":
+			// Diagnostic: enumerate cameras verbosely, show raw ffmpeg output.
+			if !ensureFFmpegInstalled(ui) {
+				break
+			}
+			cams, raw, err := f2f.ListCamerasVerbose()
+			if err != nil {
+				ui.OnLog(f2f.LogLevelError, "%v", err)
+			} else if len(cams) == 0 {
+				ui.OnLog(f2f.LogLevelWarning, "Камер не найдено.")
+			} else {
+				ui.OnLog(f2f.LogLevelSuccess, "Найдено %d камер(ы):", len(cams))
+				for i, c := range cams {
+					ui.OnLog(f2f.LogLevelInfo, "  %d) %s", i+1, c)
+				}
+			}
+			if raw != "" {
+				ui.OnLog(f2f.LogLevelInfo, "Сырой ответ ffmpeg:")
+				for _, l := range strings.Split(raw, "\n") {
+					l = strings.TrimRight(l, "\r\n ")
+					if l != "" {
+						fmt.Printf("  │ %s\n", l)
+					}
+				}
+			}
+
+		case ".ffmpeg":
+			// .ffmpeg install — force download even if PATH already has one
+			// .ffmpeg         — check status
+			if len(parts) > 1 && parts[1] == "install" {
+				ensureFFmpegInstalled(ui)
+			} else if p := f2f.ResolveFFmpeg(); p != "" {
+				ui.OnLog(f2f.LogLevelInfo, "ffmpeg: %s", p)
+			} else {
+				ui.OnLog(f2f.LogLevelWarning, "ffmpeg не найден — .ffmpeg install чтобы скачать")
+			}
+
+		case ".stopvideo":
+			target := pickCallTarget(node, nil, false)
+			if target == "" {
+				ui.OnLog(f2f.LogLevelInfo, "Нет активного вызова")
+				break
+			}
+			if err := node.StopVideo(target); err != nil {
+				ui.OnLog(f2f.LogLevelError, "Стоп видео: %v", err)
+			}
+
 		case ".help":
 			ui.PrintHelp()
 
@@ -266,9 +441,6 @@ func main() {
 	node.Shutdown()
 }
 
-func clearInputLine() {
-	fmt.Print("\033[1A\033[2K")
-}
 
 func enableANSI() {
 	if runtime.GOOS == "windows" {
@@ -282,27 +454,36 @@ func getPassword(ui *ConsoleAdapter) (string, error) {
 	if isNew {
 		ui.DrawBox("НОВЫЙ ПОЛЬЗОВАТЕЛЬ", []string{
 			"Создайте мастер-пароль для защиты ваших данных.",
-			"Шифрование: XChaCha20-Poly1305 + Argon2id.",
+			"Шифрование: XChaCha20-Poly1305 + Argon2id (256 MB).",
+			"",
+			"Рекомендации:",
+			" • passphrase из 4+ несвязанных слов, ИЛИ",
+			" • 16+ случайных символов с цифрами и знаками",
+			" • минимум 12 символов",
+			"",
 			"ВНИМАНИЕ: Пароль нельзя восстановить!",
 		})
 	} else {
+		// Show saved hint (if any) BEFORE prompting — helps the legitimate
+		// user remember, and is stored in plaintext by design.
+		if hint := f2f.LoadPasswordHint(); hint != "" {
+			ui.OnLog(f2f.LogLevelInfo, "Подсказка: %s", hint)
+		}
 		ui.OnLog(f2f.LogLevelInfo, "Введите мастер-пароль:")
 	}
 
 	fmt.Print("Пароль: ")
-	password, err := readPassword()
+	password, err := readPasswordMasked()
 	if err != nil {
 		return "", err
 	}
-	fmt.Println()
 
 	if isNew {
 		fmt.Print("Подтвердите пароль: ")
-		confirm, err := readPassword()
+		confirm, err := readPasswordMasked()
 		if err != nil {
 			return "", err
 		}
-		fmt.Println()
 
 		if password != confirm {
 			return "", fmt.Errorf("пароли не совпадают")
@@ -311,17 +492,94 @@ func getPassword(ui *ConsoleAdapter) (string, error) {
 		if len(password) < 8 {
 			return "", fmt.Errorf("пароль слишком короткий (минимум 8 символов)")
 		}
+
+		// Optional hint prompt. Use the same byte-at-a-time reader so that
+		// whatever commands the user pipes after the hint reach readline.
+		fmt.Print("Подсказка к паролю (Enter — пропустить): ")
+		hintRaw, err := readPipedLine()
+		if err != nil && len(hintRaw) == 0 {
+			return "", err
+		}
+		hint := strings.TrimSpace(hintRaw)
+		if hint != "" {
+			if err := f2f.SavePasswordHint(hint); err != nil {
+				ui.OnLog(f2f.LogLevelWarning, "Не удалось сохранить подсказку: %v", err)
+			} else {
+				ui.OnLog(f2f.LogLevelSuccess, "Подсказка сохранена (хранится открытым текстом в %s)", f2f.HintFile)
+			}
+		}
 	}
 
 	return password, nil
 }
 
-func readPassword() (string, error) {
-	password, err := term.ReadPassword(int(os.Stdin.Fd()))
-	if err != nil {
-		return "", err
+// readPipedLine reads a single line from stdin byte-by-byte. We avoid a
+// buffered reader here because readline (used later in the REPL loop) also
+// reads from os.Stdin — any buffered look-ahead would be lost to readline
+// and the user would see their commands vanish.
+func readPipedLine() (string, error) {
+	var b [1]byte
+	var line []byte
+	for {
+		_, err := os.Stdin.Read(b[:])
+		if err != nil {
+			if len(line) == 0 {
+				return "", err
+			}
+			break
+		}
+		if b[0] == '\n' {
+			break
+		}
+		line = append(line, b[0])
 	}
-	return string(password), nil
+	fmt.Println()
+	return strings.TrimRight(string(line), "\r"), nil
+}
+
+// readPasswordMasked reads a password echoing "*" for each rune typed.
+// Falls back to plain line read if raw mode isn't available (piped stdin etc).
+func readPasswordMasked() (string, error) {
+	fd := int(os.Stdin.Fd())
+	if !term.IsTerminal(fd) {
+		// Non-interactive stdin (pipe/redirect) — no echo possible and
+		// term.ReadPassword fails on Windows pipe handles with "handle is
+		// invalid", so fall back to a plain line read from the shared reader.
+		return readPipedLine()
+	}
+
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		return readPipedLine()
+	}
+	defer term.Restore(fd, oldState)
+
+	reader := bufio.NewReader(os.Stdin)
+	var runes []rune
+	for {
+		r, _, err := reader.ReadRune()
+		if err != nil {
+			return "", err
+		}
+		switch r {
+		case '\r', '\n':
+			fmt.Print("\r\n")
+			return string(runes), nil
+		case 3: // Ctrl+C
+			fmt.Print("\r\n")
+			return "", fmt.Errorf("ввод отменён")
+		case 8, 127: // Backspace / DEL
+			if len(runes) > 0 {
+				runes = runes[:len(runes)-1]
+				fmt.Print("\b \b")
+			}
+		default:
+			if unicode.IsPrint(r) {
+				runes = append(runes, r)
+				fmt.Print("*")
+			}
+		}
+	}
 }
 
 func printNodeInfo(ui *ConsoleAdapter, node *f2f.Node) {

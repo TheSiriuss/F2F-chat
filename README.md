@@ -1,537 +1,275 @@
-# F2F Chat (Alpha)
+# ASKI CHAT
 
-> **Secure P2P Messenger with Double Ratchet Protocol**  
-> Post-Compromise Security, Forward Secrecy, E2EE, File Transfer & DHT Discovery.
+```
+     _    ____  _  _____   ____ _   _    _  _____
+    / \  / ___|| |/ /_ _| / ___| | | |  / \|_   _|
+   / _ \ \___ \| ' / | | | |   | |_| | / _ \ | |
+  / ___ \ ___) | . \ | | | |___|  _  |/ ___ \| |
+ /_/   \_\____/|_|\_\___| \____|_| |_/_/   \_\_|
+```
+
+> **Decentralised P2P messenger with Signal-grade cryptography**
+> Double Ratchet • XChaCha20-Poly1305 • Post-Compromise Security
+> Voice & ASCII-video calls • File transfer • DHT discovery
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8.svg)](https://golang.org)
-[![Version](https://img.shields.io/badge/Version-1.4.0--ratchet-orange.svg)]()
+[![Version](https://img.shields.io/badge/Version-main%201.0-orange.svg)]()
 
-F2F Chat — полностью децентрализованный мессенджер с криптографией уровня Signal Protocol. Никаких серверов, никаких баз данных. Только вы, ваш собеседник и математика.
+ASKI CHAT — fully decentralised messenger with Signal Protocol-level cryptography. No servers, no databases, no accounts. Just you, your contact, and math.
 
-## Особенности
+---
 
-| Функция | Описание |
-|---------|----------|
-| **Double Ratchet** | Протокол Signal с автоматической ротацией ключей для каждого сообщения |
-| **Post-Compromise Security** | Даже после компрометации ключей система автоматически восстанавливает безопасность |
-| **Forward Secrecy** | Компрометация текущих ключей не раскрывает прошлые сообщения |
-| **XChaCha20-Poly1305** | Authenticated encryption с 192-bit nonce для каждого сообщения |
-| **X25519 DH Ratchet** | Diffie-Hellman на Curve25519 с автоматической генерацией ephemeral ключей |
-| **Out-of-Order Messages** | Поддержка до 500 пропущенных сообщений с автоматическим восстановлением |
-| **Master Password** | Все данные (identity, контакты) зашифрованы AES-256-GCM с ключом на основе Argon2id |
-| **File Transfer** | Передача файлов с прогрессом, чанкованием и SHA256 верификацией |
-| **True P2P** | Прямое соединение через LibP2P с поддержкой NAT traversal, hole punching и relay |
-| **DHT Discovery** | Поиск друзей через глобальную сеть IPFS/Kad-DHT |
-| **Mutual Trust** | Соединение возможно только при взаимном добавлении в контакты — защита от спама |
-| **CLI интерфейс** | Удобный терминальный интерфейс с поддержкой Unicode |
+## Highlights
 
-## Установка
+| Feature | Description |
+|---------|-------------|
+| **Double Ratchet** | Signal-style ratchet with per-message key rotation |
+| **Post-Compromise Security** | Automatic recovery after key compromise |
+| **Forward Secrecy** | Compromise of current keys doesn't reveal past messages |
+| **XChaCha20-Poly1305** | Authenticated encryption with 192-bit nonce per message |
+| **X25519 DH Ratchet** | Curve25519 with automatic ephemeral key rotation |
+| **Out-of-order delivery** | Up to 500 skipped messages with auto-recovery |
+| **Master password** | Identity + contacts encrypted with AES-256-GCM over Argon2id |
+| **Files** | Chunked transfer with SHA-256 verification and progress |
+| **Voice calls** | Opus-encoded 48 kHz direct P2P audio (direct-only, no relay) |
+| **Video calls** | ASCII-rendered webcam or built-in avatar over P2P |
+| **Global-only P2P** | LAN/loopback never advertised — traffic goes via public internet only |
+| **DHT discovery** | Find contacts through the global IPFS/Kad-DHT |
+| **Mutual trust** | Both sides must `.addfriend` — prevents spam and random dials |
+| **TUI** | Terminal UI built on [Bubble Tea](https://github.com/charmbracelet/bubbletea) with IDE-style autocomplete |
+| **i18n** | English / Русский / Deutsch / Français / 中文 / 日本語 |
 
-### Зависимости
+---
 
-Установите необходимые Go библиотеки:
+## Install
 
-```bash
-go get golang.org/x/crypto/chacha20poly1305
-go get golang.org/x/crypto/curve25519
-go get golang.org/x/crypto/hkdf
-go get github.com/libp2p/go-libp2p
-go get github.com/libp2p/go-libp2p-kad-dht
-```
-
-### Установка
+### Build from source
 
 ```bash
 git clone https://github.com/TheSiriuss/F2F-chat.git
 cd F2F-chat
-
-go mod tidy
-go run ./cmd/cli
+./build.sh               # standard build → f2f-cli.exe (~32 MB)
+./build.sh --upx         # UPX-compressed → f2f-cli-upx.exe (~8 MB)
 ```
 
-### Сборка бинарника
+Requires Go 1.21+ and a CGO-capable GCC (MinGW on Windows) because we statically link libopus for voice calls.
+
+### Run
 
 ```bash
-go build -o f2f-cli ./cmd/cli
+./f2f-cli
 ```
 
-## Первый запуск
-
-При первом запуске вам будет предложено создать **мастер-пароль**:
-
-```
-┌──────────────────────────────────────────┐
-│           НОВЫЙ ПОЛЬЗОВАТЕЛЬ             │
-├──────────────────────────────────────────┤
-│ Создайте мастер-пароль для защиты данных │
-│ ВНИМАНИЕ: Пароль нельзя восстановить!    │
-└──────────────────────────────────────────┘
-Пароль: ********
-Подтвердите: ********
-```
-
-> **Важно:** Потеря пароля = потеря identity и контактов.
-
-## Команды CLI
-
-### Профиль
-| Команда | Описание |
-|---------|----------|
-| `.login <nick>` | Создать/войти в профиль |
-| `.logout` | Выйти из профиля |
-| `.info` | Показать PeerID, Fingerprint и команду для друзей |
-| `.fingerprint` | Показать fingerprint вашего ключа |
-
-### Контакты
-| Команда | Описание |
-|---------|----------|
-| `.addfriend <nick> <peerID> <pubkey>` | Добавить друга |
-| `.removefriend <nick>` | Удалить контакт |
-| `.list` | Список контактов с их статусами |
-| `.find <nick>` | Найти контакт в DHT |
-| `.check` | Обновить статусы всех контактов |
-
-### Чат
-| Команда | Описание |
-|---------|----------|
-| `.connect <nick>` | Начать соединение с контактом |
-| `.accept <nick>` | Принять входящий запрос |
-| `.decline <nick>` | Отклонить запрос |
-| `.disconnect <nick>` | Отменить/разорвать соединение |
-| `.leave` | Выйти из текущего чата |
-
-### Файлы
-| Команда | Описание |
-|---------|----------|
-| `.file <путь>` | Предложить файл собеседнику |
-| `.getfile` | Принять предложенный файл |
-| `.nofile` | Отклонить/отменить передачу файла |
-
-### Сеть
-| Команда | Описание |
-|---------|----------|
-| `.bootstrap` | Подключиться к DHT нодам |
-| `.exit` | Выход из приложения |
-
-## Типичный сценарий
-
-> **Важно:** Для установления соединения **оба** пользователя должны добавить друг друга в контакты. Это защита от спама и подтверждение взаимного доверия.
-
-### Шаг 1: Оба пользователя получают свои данные
-
-**Alpha:**
-```bash
-> .login Alpha
-[+] Вы: Alpha
-
-> .bootstrap
-[+] Подключено к 3 узлам
-
-> .info
-┌─────────────────────────────────────────────┐
-│                 ВАШИ ДАННЫЕ                 │
-├─────────────────────────────────────────────┤
-│ Ник:    Alpha                               │
-│ Статус: [G] GLOBAL (relay)                  │
-│ Пиров:  3                                   │
-│ PeerID: 12D3KooWAlpha...                    │
-│ FP:     A1B2-C3D4-E5F6-G7H8                 │
-│                                             │
-│ Команда для друга:                          │
-│ .addfriend Alpha 12D3KooWAlpha... <pubkeyA> │
-└─────────────────────────────────────────────┘
-```
-
-**Bravo:**
-```bash
-> .login Bravo
-[+] Вы: Bravo
-
-> .bootstrap
-[+] Подключено к 4 узлам
-
-> .info
-┌─────────────────────────────────────────────┐
-│                 ВАШИ ДАННЫЕ                 │
-├─────────────────────────────────────────────┤
-│ Ник:    Bravo                               │
-│ Статус: [*] ONLINE                          │
-│ Пиров:  4                                   │
-│ PeerID: 12D3KooWBravo...                    │
-│ FP:     X9Y8-Z7W6-V5U4-T3S2                 │
-│                                             │
-│ Команда для друга:                          │
-│ .addfriend Bravo 12D3KooWBravo... <pubkeyB> │
-└─────────────────────────────────────────────┘
-```
-
-### Шаг 2: Обмен командами
-
-Пользователи обмениваются своими `.addfriend` командами через любой канал (лично, другой мессенджер, email и т.д.)
-
-### Шаг 3: Взаимное добавление
-
-**Alpha добавляет Bravo:**
-```bash
-> .addfriend Bravo 12D3KooWBravo... <pubkeyB>
-[+] Добавлен: Bravo
-[i] Поиск Bravo...
-```
-
-**Bravo добавляет Alpha:**
-```bash
-> .addfriend Alpha 12D3KooWAlpha... <pubkeyA>
-[+] Добавлен: Alpha
-[i] Поиск Alpha...
-```
-
-### Шаг 4: Соединение (любая сторона)
-
-**Bravo инициирует:**
-```bash
-> .connect Alpha
-[i] Поиск Alpha...
-[+] Отправлен запрос Alpha...
-```
-
-**Alpha видит запрос:**
-```bash
-[!] Запрос от Bravo! (.accept Bravo / .decline Bravo)
-
-> .accept Bravo
-[+] Чат с Bravo активен
-[i] ЧАТ: Bravo (Forward Secrecy: ON, XChaCha20)
-```
-
-### Шаг 5: Общение
-
-После установления соединения каждое сообщение шифруется **уникальным ключом**, автоматически выведенным из Double Ratchet цепочки:
-
-```bash
-[Bravo] > Привет! Как Double Ratchet работает?
-> Каждое сообщение использует свой ключ из KDF цепочки. 
-> А при каждом ответе DH ключи обновляются!
-[Вы 14:32:15]: Каждое сообщение использует свой ключ из KDF цепочки. А при каждом ответе DH ключи обновляются!
-```
-
-## Передача файлов
-
-F2F Chat поддерживает безопасную передачу файлов между пользователями с шифрованием через Double Ratchet.
-
-### Как это работает
-
-1. **Отправитель** предлагает файл командой `.file <путь>`
-2. **Получатель** видит уведомление с именем и размером файла
-3. **Получатель** принимает (`.getfile`) или отклоняет (`.nofile`)
-4. Файл передаётся чанками по 256 KB с отображением прогресса
-5. Каждый чанк шифруется через Double Ratchet (XChaCha20-Poly1305)
-6. После передачи проверяется SHA256 хеш для подтверждения целостности
-
-### Пример
-
-**Alpha отправляет файл:**
-```bash
-[Alpha] > .file ~/documents/secret.pdf
-[i] Предложен файл 'secret.pdf' (2.45 MB), ожидание ответа...
-```
-
-**Bravo получает предложение:**
-```bash
-[!] Alpha предлагает файл: secret.pdf (2.45 MB)
-[i] Используйте .getfile для принятия или .nofile для отклонения
-
-> .getfile
-[+] Принят файл 'secret.pdf' (2.45 MB), ожидание данных...
-Получение secret.pdf [████████████████████░░░░░░░░░░] 68%
-```
-
-**После завершения:**
-```bash
-[>] Файл от Alpha сохранён: secret.pdf (2.45 MB)
-[+] SHA256 проверка пройдена
-```
-
-### Особенности
-
-- Файлы шифруются тем же Double Ratchet протоколом, что и сообщения
-- Каждый чанк использует уникальный message key
-- Один файл за раз на каждый активный чат
-- Отмена передачи в любой момент через `.nofile`
-- Автоматическое переименование при конфликте имён
-- Таймаут предложения: 10 минут
-
-## Архитектура безопасности
-
-### Слои защиты
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    MASTER PASSWORD                          │
-│                         │                                   │
-│                    Argon2id KDF                             │
-│                    (memory: 64MB, time: 3, threads: 4)      │
-│                         │                                   │
-│                   AES-256-GCM Key                           │
-│                    /          \                             │
-│            identity.json    contacts.json                   │
-│           (encrypted)       (encrypted)                     │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
-│                   HANDSHAKE & SESSION                       │
-│                                                             │
-│  Alice                                      Bob             │
-│    │                                         │              │
-│    │──── Handshake (ephPubA, sig, nonce) ──> │              │
-│    │          [Signed with Ed25519]          │              │
-│    │                                         │              │
-│    │<─── Handshake (ephPubB, sig, nonce) ─── │              │
-│    │          [Signed with Ed25519]          │              │
-│    │                                         │              │
-│    │  X25519(ephPrivA, ephPubB) ──┐          │              │
-│    │                              ├─> HKDF ──> SharedSecret │
-│    │  X25519(ephPrivB, ephPubA) ──┘          │              │
-│    │                                         │              │
-│    │  InitializeRatchet(SharedSecret)        │              │
-│    │  - RootKey = SharedSecret               │              │
-│    │  - Generate new DH keys                 │              │
-│    │  - Derive ChainKeyS from DH             │              │
-│    │                                         │              │
-│    │──── Request (encrypted with Ratchet) ──>│              │
-│    │<─── Accept (encrypted with Ratchet) ────│              │
-│    │                                         │              │
-└─────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────┐
-│                   DOUBLE RATCHET PROTOCOL                   │
-│                                                             │
-│  ┌──────────────────────────────────────────────┐           │
-│  │        Symmetric Ratchet (KDF Chain)         │           │
-│  │                                              │           │
-│  │  ChainKeyS  →  HMAC  →  MsgKey₁  →  Encrypt  │           │
-│  │      ↓                                       │           │
-│  │  ChainKeyS' →  HMAC  →  MsgKey₂  →  Encrypt  │           │
-│  │      ↓                                       │           │
-│  │  ChainKeyS''→  HMAC  →  MsgKey₃  →  Encrypt  │           │
-│  │                                              │           │
-│  │  ChainKeyR  ←  HMAC  ←  MsgKey₁  ←  Decrypt  │           │
-│  │      ↓                                       │           │
-│  │  ChainKeyR' ←  HMAC  ←  MsgKey₂  ←  Decrypt  │           │
-│  └──────────────────────────────────────────────┘           │
-│                          ↕                                  │
-│  ┌──────────────────────────────────────────────┐           │
-│  │         DH Ratchet (Key Rotation)            │           │
-│  │                                              │           │
-│  │  При получении нового DH ключа:              │           │
-│  │  1. Generate new ephemeral key pair          │           │
-│  │  2. DH(local_priv, remote_pub) → shared      │           │
-│  │  3. HKDF(RootKey, shared) → NewRootKey       │           │
-│  │  4. Derive new ChainKeyS, ChainKeyR          │           │
-│  │                                              │           │
-│  │  Результат: Post-Compromise Security         │           │
-│  └──────────────────────────────────────────────┘           │
-│                                                             │
-│  Каждое сообщение отправляется с заголовком:                │
-│  - PublicKey [32]byte  (текущий DH ключ)                    │
-│  - PN uint32           (счётчик предыдущей цепочки)         │
-│  - N uint32            (номер сообщения)                    │
-│                                                             │
-│  Шифрование: XChaCha20-Poly1305                             │
-│  - 192-bit nonce (случайный для каждого сообщения)          │
-│  - 256-bit key (выведен из Chain Key)                       │
-│  - Associated Data = Ratchet Header                         │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Криптографические примитивы
-
-| Компонент | Алгоритм | Параметры |
-|-----------|----------|-----------|
-| **Symmetric Encryption** | XChaCha20-Poly1305 | 256-bit key, 192-bit nonce |
-| **Key Exchange** | X25519 (Curve25519) | ECDH |
-| **Key Derivation** | HKDF-SHA256 | Salt = RootKey, IKM = DH output |
-| **Chain KDF** | HMAC-SHA256 | MsgKey = HMAC(ChainKey, 0x01) |
-| **Signature** | Ed25519 | Handshake verification |
-| **Master Key** | Argon2id | memory=64MB, time=3, threads=4 |
-| **Identity** | AES-256-GCM | Master password derived key |
-
-### Почему Double Ratchet?
-
-**Forward Secrecy:**
-- Каждое сообщение шифруется уникальным ключом
-- Ключи выводятся из цепочки KDF и сразу удаляются
-- Компрометация текущего состояния не раскрывает прошлые сообщения
-
-**Post-Compromise Security:**
-- При каждом обмене сообщениями выполняется DH Ratchet Step
-- Генерируются новые ephemeral ключи
-- Даже если злоумышленник скомпрометировал все ключи, после следующего DH обмена безопасность восстанавливается
-
-**Out-of-Order Messages:**
-- Поддержка до 500 пропущенных сообщений
-- Автоматическое восстановление порядка
-- Карта пропущенных ключей для обработки задержанных сообщений
-
-### KDF Context Separation
-
-Для изоляции различных контекстов используются уникальные Info строки в HKDF:
-
-```go
-InfoRootKey  = []byte("F2F-Ratchet-Root")   // Для вывода RootKey
-InfoChainKey = []byte("F2F-Ratchet-Chain")  // Для вывода ChainKey
-InfoMsgKey   = []byte("F2F-Ratchet-Msg")    // Для вывода MsgKey
-```
-
-### Защита от атак
-
-| Атака | Защита |
-|-------|--------|
-| **Man-in-the-Middle** | Ed25519 подписи в Handshake + верификация публичных ключей |
-| **Replay Attack** | Nonce в каждом сообщении + SeenNonces карта + timestamp проверка |
-| **Key Compromise** | Post-Compromise Security через DH Ratchet |
-| **Message Reordering** | Счётчики сообщений (N, PN) + карта пропущенных ключей |
-| **Spam** | Взаимное добавление в контакты обязательно |
-| **Time Skew** | MaxTimeSkew = 2 минуты |
-
-### Почему взаимное добавление?
-
-При попытке `.connect` к пользователю, который вас не добавил:
-- Соединение будет отклонено на уровне протокола
-- Публичный ключ не совпадёт с ожидаемым
-- Handshake не пройдёт верификацию
-- Это предотвращает спам и нежелательные контакты
-
-## Конфигурация
-
-Все данные хранятся в текущей директории:
-- `identity.json` — зашифрованный профиль (Ed25519 + NaCl ключи)
-- `contacts.json` — зашифрованный список контактов
-
-### Переменные окружения (CLI)
-```bash
-F2F_ASCII=1    # Принудительно ASCII-графика
-F2F_UNICODE=1  # Принудительно Unicode-графика
-```
-
-### Параметры безопасности
-
-```go
-const (
-    ProtocolVersion  = "1.4.0-ratchet"  // Текущая версия протокола
-    MaxSkipKeys      = 500              // Лимит пропущенных ключей
-    MaxTimeSkew      = 2 * time.Minute  // Допустимое расхождение времени
-    MaxNoncesPerContact = 100           // Размер nonce кеша
-    FileChunkSize    = 256 * 1024       // 256 KB на чанк файла
-)
-```
-
-## Производительность
-
-### Overhead на сообщение
-
-- **Ratchet Header**: 40 байт (32 байт DH ключ + 8 байт счётчики)
-- **XChaCha20-Poly1305 overhead**: 40 байт (24 байт nonce + 16 байт auth tag)
-- **Общий overhead**: ~80 байт на сообщение
-
-### Скорость
-
-- **KDF операции**: ~0.1 мс (HMAC-SHA256)
-- **DH Ratchet Step**: ~1 мс (X25519 + HKDF)
-- **Шифрование/дешифрование**: ~0.05 мс на KB (XChaCha20-Poly1305)
-
-### Память
-
-- **RatchetState**: ~500 байт базовая структура
-- **SkippedMsgKeys**: до 500 ключей × 32 байта = 16 KB максимум
-- **Файловые буферы**: 256 KB на активную передачу
-
-## Сравнение с другими протоколами
-
-| Протокол | Forward Secrecy | Post-Compromise Security | Out-of-Order | Complexity |
-|----------|----------------|-------------------------|--------------|------------|
-| **F2F (Double Ratchet)** | ✅ Да | ✅ Да | ✅ До 500 сообщений | Средняя |
-| **Signal Protocol** | ✅ Да | ✅ Да | ✅ Да | Средняя |
-| **TLS 1.3** | ✅ Да (PFS) | ❌ Нет | ✅ Да | Высокая |
-| **NaCl secretbox (static)** | ❌ Нет | ❌ Нет | ✅ Да | Низкая |
-| **OTR** | ✅ Да | ⚠️  Частично | ❌ Нет | Средняя |
-
-## Дисклеймер
-
-> **Alpha версия.** Код не прошёл профессиональный аудит безопасности.  
-> Используйте на свой страх и риск в некритичных сценариях.
-
-### Известные ограничения
-- Требуется взаимное добавление в контакты
-- Нет офлайн-сообщений (требуется одновременное присутствие в сети)
-- Нет групповых чатов
-- Пароль нельзя восстановить
-- Сессии не персистентны (при перезапуске создаётся новая сессия)
-- MaxSkipKeys ограничивает out-of-order обработку 500 сообщениями
-
-### Будущие улучшения
-- [ ] Персистентное состояние Ratchet (сохранение между сессиями)
-- [ ] Поддержка групповых чатов с групповым Ratchet
-- [ ] Асинхронная доставка сообщений через relay
-- [ ] Backup/restore ключей с паролём
-- [ ] Верификация fingerprint через QR-коды
-- [ ] Аудит безопасности профессиональными криптографами
-
-## Разработка
-
-### Структура проекта
-
-```
-F2F-chat/
-├── pkg/f2f/
-│   ├── api.go           # Публичные API методы
-│   ├── node.go          # Основная структура Node
-│   ├── crypto.go        # Double Ratchet + криптография
-│   ├── session.go       # Управление сессиями
-│   ├── protocol.go      # Протокол сообщений
-│   ├── file.go          # Передача файлов
-│   └── storage.go       # Персистентное хранилище
-├── cmd/cli/             # CLI интерфейс
-└── README.md
-```
-
-### Тестирование
-
-```bash
-# Запуск тестов
-go test ./pkg/f2f/...
-
-# Тестирование Double Ratchet
-go test -v -run TestRatchet ./pkg/f2f/
-
-# Бенчмарк криптографии
-go test -bench=. ./pkg/f2f/
-```
-
-### Вклад в проект
-
-Приветствуются:
-- Аудит криптографической реализации
-- Тестирование протокола безопасности
-- Оптимизация производительности
-- Улучшение UX
-- Документация
-
-## Лицензия
-
-AGPL v3 - см. [LICENSE](LICENSE)
-
-## Поддержка (XMR)
-
-Если проект вам полезен, вы можете поддержать разработку:
-
-```
-88iF1b5H5MUUZFBPc5r8L9eBvJyjTL3uUYeuzqjPiFm5K5WgcaTcW6v7CJ8ZC5EJrtUUSJ8zNaMFHS75ofUqJLkfLqNY5wB
-```
-
-[![Monero](https://img.shields.io/badge/Monero-Donate-FF6600?logo=monero)](https://www.getmonero.org/)
+On first start you'll be asked for a master password. The password encrypts your identity key and contacts on disk via Argon2id (256 MB / t=4) — the app is **useless to anyone without it**. Pick a strong one.
 
 ---
 
-**Безопасного общения! 🔐**
+## Quickstart
+
+Open the TUI, press `.` in the input field — a dropdown with every command appears.
+
+```
+.bootstrap                 connect to the DHT
+.login nikita              create or load the "nikita" profile
+.info                      show your PeerID + fingerprint
+.copy                      copy the .addfriend line into clipboard
+```
+
+Send the output of `.copy` to your friend (via Signal, email, carrier pigeon — any out-of-band channel). They run it verbatim on their side:
+
+```
+.addfriend nikita 12D3KooW...abc base64pub==
+```
+
+Then both of you:
+
+```
+.connect nikita            open an encrypted chat
+type a message             just hit Enter to send
+.call nikita               voice call (Opus, direct P2P)
+.vidcall nikita            video call (ASCII webcam or built-in avatar)
+.file /path/to/file        send a file
+.hangup                    end the call
+.leave                     leave the chat
+```
+
+Full command list: `?` in the input, or browse the autocomplete dropdown.
+
+---
+
+## Call protocol — why you might see "relay refused"
+
+ASKI CHAT is a true P2P app. Audio/video calls go through a **direct** libp2p connection — never through a public relay — for two reasons:
+
+1. **Bandwidth**: circuit-v2 relays have a 128 KiB per-direction data cap. That's ~14 seconds of voice at 48 kbit/s or ~6 seconds of video before the relay resets you.
+2. **Privacy**: relay operators see traffic volume and timing. Direct connections don't.
+
+If your NAT is symmetric (common on mobile carriers and some corporate networks) and hole-punching fails, `.call` will **refuse to start** instead of dropping the call mid-sentence. You'll see a clear message pointing at workarounds (VPN, IPv6, running your own relay).
+
+Text chat + files still work over relay as a fallback — they fit within the bandwidth budget.
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                         USER (TUI)                           │
+│  • dot-command palette with contact-aware autocomplete       │
+│  • dedicated call view with ASCII video viewport             │
+│  • i18n — 6 languages, switchable at runtime (.language)     │
+└─────────────────────────────┬────────────────────────────────┘
+                              │
+┌─────────────────────────────┴────────────────────────────────┐
+│                        f2f.Node                              │
+│                                                              │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────┐  │
+│  │ Chat stream  │   │ Call stream  │   │  Video stream    │  │
+│  │              │   │              │   │                  │  │
+│  │ Double       │   │ Per-frame    │   │ Per-frame        │  │
+│  │ Ratchet      │   │ XChaCha20    │   │ XChaCha20        │  │
+│  │ (msgs/files) │   │ (Opus audio) │   │ (ASCII video)    │  │
+│  └──────────────┘   └──────────────┘   └──────────────────┘  │
+│                                                              │
+│  Per-protocol HKDF key derivation from shared secret so      │
+│  chat/call/video keys can never accidentally overlap.        │
+└─────────────────────────────┬────────────────────────────────┘
+                              │
+┌─────────────────────────────┴────────────────────────────────┐
+│                       libp2p / Kad-DHT                       │
+│  • QUIC + TCP transports, holepunch (DCUtR), relay fallback  │
+│  • Connection manager with protected contacts                │
+│  • 20-second libp2p ping keepalive to preserve NAT mapping   │
+│  • Global-only address advertisement (LAN/loopback filtered) │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Crypto
+- **Chat messages**: Double Ratchet (HKDF-SHA256 + X25519 DH ratchet + symmetric ratchet). Per-message `MsgKey` never repeats. PCS after 30 sec of activity.
+- **Voice frames**: XChaCha20-Poly1305 with monotonic counter nonce; per-frame HKDF rotation every 250 frames.
+- **Video frames**: Same scheme, independent HKDF info string.
+- **Stored files** (`identity.dat`, `contacts.dat`): AES-256-GCM with key derived via Argon2id from the master password (256 MB / t=4 / 32-byte salt).
+
+### Networking
+- **Discovery**: Kad-DHT via `libp2p.EnableRelay()` + bootstrap peers.
+- **Dial**: DHT `FindPeer` → direct dial all addresses → hole-punch via DCUtR.
+- **Relay**: circuit-v2 stays around for chat/files if direct fails, but voice/video refuse it explicitly.
+- **Keep-alive**: periodic libp2p Ping every 20 s to each contact to keep UDP NAT mappings warm.
+
+---
+
+## Configuration
+
+Stored in `settings.json` alongside the binary:
+
+| Field | Description |
+|-------|-------------|
+| `audio_input_device_id` / `_name` | Microphone (set via `.settings input <N>`) |
+| `audio_output_device_id` / `_name` | Speakers (`.settings output <N>`) |
+| `voice_auto_play` | Auto-play incoming `.wav` voicemails |
+| `video_source_type` | `"ascii"` (default, no camera), `"camera"`, `"file"` |
+| `video_camera_id` | DirectShow / V4L2 / AVFoundation device name |
+| `video_source_path` | Image/GIF used when type == `"file"` |
+| `language` | UI language: `en` / `ru` / `de` / `fr` / `zh` / `ja` |
+
+Change anything at runtime through `.settings` — the TUI persists changes automatically.
+
+---
+
+## Security model
+
+### Threats we defend against
+- **Passive eavesdropping**: everything end-to-end encrypted, no plaintext on the wire.
+- **Relay-operator snooping**: direct connections for calls; chat ratcheted.
+- **Local device compromise (post-factum)**: forward secrecy means past messages stay encrypted.
+- **Disk seizure**: identity + contacts encrypted with Argon2id-derived key; attacker needs your password.
+- **Message forgery**: Poly1305 AEAD tag on every frame; counter nonces prevent replays.
+- **Man-in-the-middle**: 160-bit fingerprint for out-of-band verification.
+- **Spam / random dials**: mutual `.addfriend` required — you literally can't receive anything from unverified peers.
+
+### Threats we *don't* claim to defend against
+- **Keylogger on your machine**: we can't encrypt what you type before you type it.
+- **Coercion to reveal password**: the password is your responsibility.
+- **Global adversary doing traffic analysis**: this is P2P, not Tor. Your IP is visible to your contact (and to DHT peers until hole-punch completes).
+- **Compromise of libp2p identity at runtime**: memory dump = active ratchet keys exposed. PCS limits the blast radius but not a point-in-time snapshot.
+
+### Cryptographic choices
+| What | Why |
+|------|-----|
+| XChaCha20-Poly1305 | 192-bit nonce eliminates any possibility of nonce reuse |
+| X25519 | Fastest audited curve; constant-time impl in Go stdlib |
+| HKDF-SHA256 | Standard, no rust/CGO dependency |
+| Argon2id (256 MB / t=4) | Memory-hard — even GPUs slow down dramatically |
+| Ed25519 signatures | On the handshake envelope; binds ephemeral DH to long-term identity |
+
+---
+
+## Testing
+
+```bash
+go test ./pkg/f2f/...                     # full suite
+go test -run TestReal_Direct ./pkg/f2f/   # real-libp2p + 70-second voice call
+go test -run TestReal_Relay ./pkg/f2f/    # relay refusal policy verified
+```
+
+25+ real-libp2p tests cover:
+- Connect handshake, reconnect, race-both-sides-dial, stale addr survival
+- Stream-level message/file delivery
+- Voice-call offer / accept / decline / hangup / double-offer rejection
+- Relay bandwidth cap reproduced + call refused when relay-only
+- 70-second direct voice call staying in `CallActive`
+
+---
+
+## Project layout
+
+```
+cmd/
+  cli/                    main entry point + TUI
+    tui/                  Bubble Tea model, views, i18n, banner
+    audio.go              legacy CLI audio handlers
+    ...
+  asciigen/               one-shot: PNG → embedded ASCII frame
+pkg/
+  f2f/                    core library
+    call.go               voice-call protocol (own libp2p stream)
+    video.go              ASCII-video capture + transmission
+    camera.go             ffmpeg subprocess for webcam
+    ascii.go              image → ASCII rendering
+    ascii_logo.go         embedded ASKI avatar
+    network.go            chat stream (.connect) flow
+    crypto.go             HKDF / Argon2id / fingerprint
+    call.go               in-band call signaling + DCUtR upgrade
+    ...
+aski.png / aski2.png / aski3.png
+build.sh
+README.md                 (this file)
+```
+
+---
+
+## Roadmap
+
+- **Own relay server** mode (`f2f-cli --relay --listen ...`) with `WithInfiniteLimits()` so users with symmetric NAT can run their own relay without the 128 KiB cap
+- **Encrypted group chats** (MLS-style)
+- **Offline queue** — retry send when peer comes online (already partially supported via contacts.dat)
+- **Call-screen video source switch** without restarting the call
+- **Tor transport** as an optional privacy layer
+
+---
+
+## Status
+
+**Main branch 1.0** — early, works. Use at your own risk.
+Not audited. Don't use for anything where life / liberty / livelihood depend on it.
+
+Bug reports welcome via GitHub issues.
+
+---
+
+## License
+
+GNU Affero General Public License v3.0 — see [LICENSE](LICENSE).
+
+TL;DR: you can use, modify, and distribute this, but any public service built on it must also be open-source under AGPL.
