@@ -7,7 +7,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/TheSiriuss/aski/pkg/aski"
+	"github.com/TheSiriuss/aski-chat/pkg/aski"
 	"github.com/chzyer/readline"
 )
 

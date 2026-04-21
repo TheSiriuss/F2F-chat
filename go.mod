@@ -1,4 +1,4 @@
-module github.com/TheSiriuss/aski
+module github.com/TheSiriuss/aski-chat
 
 go 1.25.7
 

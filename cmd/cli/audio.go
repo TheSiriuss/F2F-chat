@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/TheSiriuss/aski/pkg/aski"
+	"github.com/TheSiriuss/aski-chat/pkg/aski"
 	"github.com/chzyer/readline"
 )
 

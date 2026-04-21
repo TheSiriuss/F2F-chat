@@ -10,8 +10,8 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/TheSiriuss/aski/cmd/cli/tui"
-	"github.com/TheSiriuss/aski/pkg/aski"
+	"github.com/TheSiriuss/aski-chat/cmd/cli/tui"
+	"github.com/TheSiriuss/aski-chat/pkg/aski"
 	"github.com/chzyer/readline"
 	"golang.org/x/term"
 )

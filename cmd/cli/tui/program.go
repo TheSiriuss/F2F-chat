@@ -7,7 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"golang.org/x/term"
 
-	"github.com/TheSiriuss/aski/pkg/aski"
+	"github.com/TheSiriuss/aski-chat/pkg/aski"
 )
 
 // Run starts the full-screen TUI event loop. Blocks until the user quits.

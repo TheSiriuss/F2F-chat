@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/TheSiriuss/aski/pkg/aski"
+	"github.com/TheSiriuss/aski-chat/pkg/aski"
 )
 
 // ensureFFmpegInstalled checks for ffmpeg and, if missing, downloads it

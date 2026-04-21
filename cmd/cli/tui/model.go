@@ -11,7 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/libp2p/go-libp2p/core/peer"
 
-	"github.com/TheSiriuss/aski/pkg/aski"
+	"github.com/TheSiriuss/aski-chat/pkg/aski"
 )
 
 // stripControls removes ASCII control characters (except TAB/space) from
