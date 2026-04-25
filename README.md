@@ -12,7 +12,7 @@
 > Double Ratchet • XChaCha20-Poly1305 • Post-Compromise Security
 > Voice & ASCII-video calls • File transfer • DHT discovery
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![License: WTFPL](https://img.shields.io/badge/License-WTFPL-brightgreen.svg)](http://www.wtfpl.net/)
 [![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8.svg)](https://golang.org)
 [![Version](https://img.shields.io/badge/Version-main%201.0-orange.svg)]()
 
@@ -47,8 +47,8 @@ ASKI CHAT — fully decentralised messenger with Signal Protocol-level cryptogra
 ### Build from source
 
 ```bash
-git clone https://github.com/TheSiriuss/F2F-chat.git
-cd F2F-chat
+git clone https://github.com/TheSiriuss/Aski-chat.git
+cd Aski-chat
 ./build.sh               # standard build → f2f-cli.exe (~32 MB)
 ./build.sh --upx         # UPX-compressed → f2f-cli-upx.exe (~8 MB)
 ```
@@ -270,6 +270,6 @@ Bug reports welcome via GitHub issues.
 
 ## License
 
-GNU Affero General Public License v3.0 — see [LICENSE](LICENSE).
+[Do What The Fuck You Want To Public License (WTFPL)](http://www.wtfpl.net/) — see [LICENSE](LICENSE).
 
-TL;DR: you can use, modify, and distribute this, but any public service built on it must also be open-source under AGPL.
+TL;DR: do whatever you want with this code. No restrictions, no warranty.
